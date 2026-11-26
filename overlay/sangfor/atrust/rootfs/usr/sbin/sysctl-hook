@@ -1,0 +1,11 @@
+#!/bin/sh
+# Container sysctl wrapper for aTrust: allow utun7.route_localnet=1 to succeed
+# if the kernel already has the value set or blocks writing in a container.
+if [ "-w net.ipv4.conf.utun7.route_localnet=1" = "$*" ]; then
+    if [ "1" = "$(/usr/sbin/sysctl.real -n net.ipv4.conf.utun7.route_localnet 2>/dev/null)" ] \
+        || /usr/sbin/sysctl.real "$@" 2>/dev/null; then
+        exit 0
+    fi
+    exit 1
+fi
+exec /usr/sbin/sysctl.real "$@"

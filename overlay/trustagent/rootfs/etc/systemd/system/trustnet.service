@@ -1,0 +1,14 @@
+[Unit]
+Description=TrustAgent bypass route table setup
+Wants=network-online.target
+After=network-online.target zt-net.service
+
+[Service]
+Type=oneshot
+NoNewPrivileges=true
+PassEnvironment=BYPASS_ROUTES
+ExecStart=/usr/local/bin/zt-trustagent-routes.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

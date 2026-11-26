@@ -1,0 +1,5 @@
+#!/bin/bash
+# The desktop has no browser. A link the client opens is written down instead,
+# in ~/open-urls of whoever runs the client, to be opened on the host through
+# the client's SOCKS port. Upstream does the same into /root/open-urls.
+printf '%s\n' "$*" >> "$HOME/open-urls"

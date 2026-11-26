@@ -1,0 +1,13 @@
+[Unit]
+Description=Network policy: only the host may reach this container
+After=network-online.target
+Before=kasmvnc.service zt-sangfor.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+PassEnvironment=ZT_NET_MODE
+ExecStart=/usr/local/bin/zt-net-setup.sh
+
+[Install]
+WantedBy=multi-user.target

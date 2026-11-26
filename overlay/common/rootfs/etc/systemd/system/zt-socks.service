@@ -1,0 +1,13 @@
+[Unit]
+Description=SOCKS5 into the VPN tunnel, for the bridge on the host
+After=network.target
+
+[Service]
+User=nobody
+ExecStart=/usr/bin/microsocks -i 127.0.0.1 -p 1080
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=TrustAgent vnic interface remove hook (%I)
+
+[Service]
+Type=oneshot
+NoNewPrivileges=true
+RemainAfterExit=no
+ExecStart=/usr/local/bin/zt-vnic-remove.sh %i

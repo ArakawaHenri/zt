@@ -1,0 +1,79 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Lint shell scripts
+        if: runner.os != 'Windows'
+        run: make lint
+
+      - name: Validate install.ps1 PowerShell syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'install.ps1'), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { throw ($errors -join "`n") }
+
+      - name: Build single-file zipapps (zt and zt.pyz)
+        shell: bash
+        run: |
+          python tools/mkzt.py -o zt
+          python tools/mkzt.py -o zt.pyz
+          python -c "import pathlib; assert pathlib.Path('zt').read_bytes() == pathlib.Path('zt.pyz').read_bytes()"
+
+      - name: Run unit tests under -W error
+        shell: bash
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          PYTHONPATH: src
+        run: python -W error -m unittest discover -s tests -v
+
+      - name: Smoke-test standalone zipapp
+        shell: bash
+        run: python zt --version && python zt --help > /dev/null
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build release artifacts
+        run: |
+          python tools/mkzt.py -o zt
+          python tools/mkzt.py -o zt.pyz
+          sha256sum zt zt.pyz > SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            zt
+            zt.pyz
+            SHA256SUMS

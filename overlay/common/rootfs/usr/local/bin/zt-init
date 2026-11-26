@@ -1,0 +1,78 @@
+#!/bin/bash
+# Container entrypoint, replacing the base image's `exec systemd`.
+#
+# 1. Creates /dev/net/tun when the engine cannot pass it in (Apple Container).
+# 2. Syncs /etc/localtime to the host timezone in TZ.
+# 3. When a persistent state volume is mounted at /var/lib/zt-state, restores
+#    stable machine-id, KasmVNC TLS certificate, and client login-state mounts
+#    declared in /etc/zt/state-paths.conf so container recreates keep logins.
+set -e
+
+mkdir -p /dev/net
+[ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200
+
+if [ -n "${TZ:-}" ] && [ -e "/usr/share/zoneinfo/$TZ" ]; then
+    ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime
+fi
+
+STATE_ROOT=/var/lib/zt-state
+if [ -d "$STATE_ROOT" ] && mountpoint -q "$STATE_ROOT"; then
+    # Keep a unique, stable /etc/machine-id per state volume across container
+    # recreates so zero-trust device identity survives upgrades & accept changes.
+    if [ ! -s "$STATE_ROOT/machine-id" ]; then
+        printf '%s\n' "$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')" > "$STATE_ROOT/machine-id"
+        chmod 0444 "$STATE_ROOT/machine-id"
+    fi
+    cp "$STATE_ROOT/machine-id" /etc/machine-id
+    chmod 0444 /etc/machine-id
+
+    # Keep the self-signed KasmVNC TLS cert stable across base-image rebuilds.
+    CERT=/etc/ssl/certs/ssl-cert-snakeoil.pem
+    KEY=/etc/ssl/private/ssl-cert-snakeoil.key
+    if [ -f "$STATE_ROOT/tls/cert.pem" ] && [ -f "$STATE_ROOT/tls/key.pem" ]; then
+        install -o root -g root -m 0644 "$STATE_ROOT/tls/cert.pem" "$CERT"
+        install -o root -g ssl-cert -m 0640 "$STATE_ROOT/tls/key.pem" "$KEY"
+    elif [ -f "$CERT" ] && [ -f "$KEY" ]; then
+        install -d -o root -g root -m 0700 "$STATE_ROOT/tls"
+        install -o root -g root -m 0644 "$CERT" "$STATE_ROOT/tls/cert.pem"
+        install -o root -g ssl-cert -m 0640 "$KEY" "$STATE_ROOT/tls/key.pem"
+    fi
+
+    # Bind-mount each declared client state directory from the persistent volume.
+    if [ -r /etc/zt/state-paths.conf ]; then
+        while IFS=' ' read -r slot target owner mode; do
+            [ -z "$slot" ] && continue
+            case "$slot" in
+                \#*) continue ;;
+            esac
+            src="$STATE_ROOT/$slot"
+            if [ ! -d "$src" ]; then
+                install -d -m "$mode" "$src"
+                if [ -d "$target" ]; then
+                    cp -a "$target/." "$src/"
+                fi
+                chown "$owner" "$src"
+                chmod "$mode" "$src"
+            fi
+            mkdir -p "$target"
+            mount --bind "$src" "$target"
+        done < /etc/zt/state-paths.conf
+    fi
+
+    # Always refresh image-managed Openbox config inside persisted ~/.config.
+    if [ -d /etc/zt/openbox ] && [ -d /home/kasm-user/.config ]; then
+        install -d -o kasm-user -g kasm-user -m 0755 /home/kasm-user/.config/openbox
+        for cfg in autostart menu.xml; do
+            if [ -f "/etc/zt/openbox/$cfg" ]; then
+                install -o kasm-user -g kasm-user -m 0644 "/etc/zt/openbox/$cfg" "/home/kasm-user/.config/openbox/$cfg"
+            fi
+        done
+    fi
+
+    # Clean stale Unix domain sockets left behind by a previously killed aTrust container.
+    if [ -d /usr/share/sangfor/.aTrust/var/run ]; then
+        find /usr/share/sangfor/.aTrust/var/run -type s -delete 2>/dev/null || true
+    fi
+fi
+
+exec /lib/systemd/systemd "$@"

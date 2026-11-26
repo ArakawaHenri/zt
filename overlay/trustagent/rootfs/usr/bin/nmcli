@@ -1,0 +1,7 @@
+#!/bin/sh
+# TrustAgent's launcher refuses to start the client unless nmcli is on PATH, and
+# the client itself only asks `nmcli device show` for hardware details.
+# NetworkManager has nothing to run in this container, so answer the way nmcli
+# does wherever it is installed but not running.
+echo 'Error: NetworkManager (dbus) is not running.' >&2
+exit 1

@@ -1,0 +1,9 @@
+# Assembled single-file zipapp executables.
+/zt
+/zt.pyz
+
+# Python bytecode & OS metadata.
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

@@ -1,0 +1,28 @@
+#!/bin/sh
+# Minimal loginctl stand-in for Sangfor aTrust: creates the non-root `sangfor`
+# service user on first query and reports a synthetic graphical session so
+# aTrust's local HTTP helper binds as that user rather than root.
+set -eu
+if [ ! -e /home/sangfor ]; then
+    useradd sangfor --home-dir /home/sangfor --uid 1234 -m
+fi
+if [ "$*" = "--no-legend list-sessions" ]; then
+    echo "10644 1234 sangfor seat0"
+    exit 0
+fi
+if [ "${1:-}" = "show-session" ]; then
+    cat <<'EOF'
+Id=10644
+User=1234
+Name=sangfor
+Display=:1
+Remote=no
+Type=x11
+Class=user
+Active=yes
+State=active
+LockedHint=no
+EOF
+    exit 0
+fi
+exit 1
