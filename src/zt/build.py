@@ -251,28 +251,71 @@ def build_context(name, arch=None):
     return context, digest
 
 
+def _base_oci_dir(arch):
+    return cache_dir() / 'oci' / f'base-{arch}-{base_digest(arch)}'
+
+
+def _csv_quote(value):
+    text = str(value)
+    if any(ch in text for ch in (',', '"', ' ', '\t')):
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
 def build(engine, name, force=False, arch=None, tag=None):
     """Build `name` if missing (or forced), returning its image ref (or custom `tag`)."""
     arch = arch or target_arch()
     spec = spec_of(name)
     ref = tag or current_ref(name, arch)
-    if engine.image_exists(ref) and not force:
+    external_builder = getattr(engine, 'needs_external_build_load', False) is True
+    base_oci = _base_oci_dir(arch) if external_builder else None
+    oci_ready = (name != 'base') or (not external_builder) or (base_oci / 'oci-layout').is_file()
+    if engine.image_exists(ref) and not force and oci_ready:
         say(f'{name}: image up to date ({ref})')
         return ref
     if name != 'base':
         build(engine, 'base', arch=arch)
     context, _ = build_context(name, arch=arch)
     say(f'==> building {ref} ({platform_for(arch)})')
-    engine.run_cli(
-        'build',
-        '--platform', platform_for(arch),
-        '-f', str(context / spec['dockerfile']),
-        '-t', ref,
-        '--label', 'org.zt.managed=true',
-        '--label', f'org.zt.profile={name}',
-        '--label', f'org.zt.arch={arch}',
-        *[f'--build-arg={key}={value}' for key, value in build_args(spec, arch).items()],
-        str(context),
-        timeout=3600,
-    )
+
+    extra_args = []
+    staging_oci = None
+    if external_builder:
+        extra_args.append('--load')
+        if name == 'base':
+            base_oci.parent.mkdir(parents=True, exist_ok=True)
+            staging_oci = Path(tempfile.mkdtemp(prefix=f'.base-{arch}-', dir=base_oci.parent))
+            extra_args += ['--output', f'type=oci,dest={_csv_quote(staging_oci)},tar=false']
+        else:
+            base_ref = current_ref('base', arch)
+            extra_args += ['--build-context', f'{base_ref}=oci-layout://{base_oci.as_posix()}']
+
+    try:
+        engine.run_cli(
+            'build',
+            '--platform', platform_for(arch),
+            '-f', str(context / spec['dockerfile']),
+            '-t', ref,
+            '--label', 'org.zt.managed=true',
+            '--label', f'org.zt.profile={name}',
+            '--label', f'org.zt.arch={arch}',
+            *[f'--build-arg={key}={value}' for key, value in build_args(spec, arch).items()],
+            *extra_args,
+            str(context),
+            timeout=3600,
+        )
+        if staging_oci is not None:
+            if not (staging_oci / 'oci-layout').is_file():
+                die(f'buildx did not export OCI layout for {ref}')
+            if base_oci.exists():
+                shutil.rmtree(base_oci, ignore_errors=True)
+            staging_oci.rename(base_oci)
+            staging_oci = None
+            for stale in base_oci.parent.glob(f'base-{arch}-*'):
+                if stale != base_oci and not stale.name.startswith('.'):
+                    shutil.rmtree(stale, ignore_errors=True)
+    except BaseException:
+        if staging_oci is not None:
+            shutil.rmtree(staging_oci, ignore_errors=True)
+        raise
     return ref

@@ -1505,6 +1505,57 @@ class Engines(unittest.TestCase):
             cli.cmd_down(argparse.Namespace(target='atrust'))
         eng.run_cli.assert_called_once_with('stop', '-t', '8', 'zt-atrust', quiet=True)
 
+    def test_docker_container_buildx_driver_uses_load_and_local_oci_base_context(self):
+        # Driver detection: 'docker' -> False, 'docker-container' -> True, missing buildx -> False.
+        d_native = engine.DockerEngine()
+        with mock.patch.object(d_native, 'run_cli', return_value=self.answer('Name: default\nDriver: docker\n')):
+            self.assertFalse(d_native.needs_external_build_load)
+
+        d_container = engine.DockerEngine()
+        with mock.patch.object(
+            d_container, 'run_cli',
+            return_value=self.answer('Name: default\nDriver: docker-container\n'),
+        ):
+            self.assertTrue(d_container.needs_external_build_load)
+
+        d_podman_plain = engine.DockerEngine()
+        with mock.patch.object(d_podman_plain, 'run_cli', return_value=self.answer('', 1)):
+            self.assertFalse(d_podman_plain.needs_external_build_load)
+
+        # Under docker-container driver, base exports OCI layout + --load and child mounts it via --build-context.
+        calls = []
+
+        def fake_cli(*args, quiet=False, check=True, timeout=None, env=None):
+            calls.append(args)
+            if '--output' in args:
+                out_spec = args[args.index('--output') + 1]
+                dest = out_spec.split('dest=', 1)[1].split(',tar=', 1)[0].strip('"')
+                (Path(dest) / 'oci-layout').write_text('{"imageLayoutVersion":"1.0.0"}\n', encoding='utf-8')
+            return self.answer()
+
+        eng = mock.Mock(cli='docker', display_name='Docker', needs_external_build_load=True)
+        eng.image_exists.return_value = False
+        eng.run_cli.side_effect = fake_cli
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {'ZT_CACHE': tmp}), \
+                mock.patch.object(build, 'build_context', return_value=(Path(tmp), 'deadbeef1234')), \
+                contextlib.redirect_stdout(io.StringIO()):
+            build.build(eng, 'trustagent', force=True, arch='arm64')
+
+            self.assertEqual(len(calls), 2)
+            base_call, child_call = calls
+            self.assertIn('--load', base_call)
+            self.assertIn('--output', base_call)
+            self.assertIn('type=oci,dest=', base_call[base_call.index('--output') + 1])
+            self.assertIn('--load', child_call)
+            self.assertIn('--build-context', child_call)
+            base_ref = build.current_ref('base', 'arm64')
+            ctx_arg = child_call[child_call.index('--build-context') + 1]
+            self.assertTrue(ctx_arg.startswith(f'{base_ref}=oci-layout://'), ctx_arg)
+            oci_path = Path(ctx_arg.split('=oci-layout://', 1)[1])
+            self.assertTrue((oci_path / 'oci-layout').is_file())
+
     def test_docker_net_mode_switches_to_subnet_for_accept_all_and_rootless_podman(self):
         # Hostname containing 'podman' must NOT false-positive as Podman on regular Docker!
         docker = engine.DockerEngine()

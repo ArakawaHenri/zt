@@ -268,6 +268,10 @@ class Engine:
         return False
 
     @property
+    def needs_external_build_load(self):
+        return False
+
+    @property
     def net_mode(self):
         return self.net_mode_for('local')
 
@@ -569,6 +573,27 @@ class DockerEngine(Engine):
             has_apparmor=has_apparmor,
             is_desktop_vm=is_desktop_vm,
         )
+
+    @functools.cached_property
+    def _buildx_driver(self):
+        """Return active `docker buildx` driver name (e.g. 'docker', 'docker-container'), or ''."""
+        try:
+            proc = self.run_cli('buildx', 'inspect', quiet=True, check=False, timeout=10, retry=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return ''
+        if proc.returncode != 0:
+            return ''
+        for line in proc.stdout.splitlines():
+            if line.startswith('Driver:'):
+                return line.split(':', 1)[1].strip()
+        return ''
+
+    @property
+    def needs_external_build_load(self):
+        # Non-'docker' buildx drivers (e.g. 'docker-container', 'remote') build in an
+        # isolated BuildKit daemon that neither loads results into the local image store
+        # nor sees local images for `FROM ${BASE_IMAGE}`.
+        return bool(self._buildx_driver and self._buildx_driver != 'docker')
 
     @property
     def is_podman(self):
