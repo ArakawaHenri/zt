@@ -463,6 +463,7 @@ class SecurityContracts(unittest.TestCase):
         self.assertIn('/etc/machine-id', init_sh)
         self.assertIn('/etc/zt/state-paths.conf', init_sh)
         self.assertIn('mount --bind "$src" "$target"', init_sh)
+        self.assertIn('mount -o remount,rw /sys/fs/cgroup', init_sh)
         self.assertIn('/etc/zt/openbox', init_sh)
         self.assertIn('openssl req -x509', init_sh)
 
@@ -1433,6 +1434,41 @@ class Engines(unittest.TestCase):
             eng.run_cli('ps', quiet=True)
         self.assertIn('zt: "docker ps" failed:', err.getvalue())
 
+        gordon_err = (
+            "ERROR: failed to solve: bad dockerfile\n"
+            "\n"
+            "What's next:\n"
+            '    Debug this build failure with Gordon -> docker ai "help me fix this build failure"\n'
+        )
+        with mock.patch.object(engine.subprocess, 'run', return_value=self.answer('', 1, gordon_err)), \
+                contextlib.redirect_stderr(io.StringIO()) as err, \
+                self.assertRaises(SystemExit):
+            eng.run_cli('build', '-f', 'Dockerfile', '.', quiet=True)
+        self.assertIn('zt: "docker build" failed: ERROR: failed to solve: bad dockerfile', err.getvalue())
+        self.assertNotIn('Gordon', err.getvalue())
+
+    def test_build_and_stop_use_cross_engine_compatible_flags(self):
+        eng = mock.Mock(cli='docker', display_name='Docker')
+        eng.image_exists.return_value = False
+        eng.container_state.return_value = 'running'
+        eng.run_cli.return_value = self.answer()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(build, 'build_context', return_value=(Path(tmp), 'deadbeef1234')), \
+                contextlib.redirect_stdout(io.StringIO()):
+            build.build(eng, 'base', force=True, arch='arm64')
+        build_args = eng.run_cli.call_args.args
+        self.assertEqual(build_args[0], 'build')
+        self.assertIn('--label', build_args)
+        self.assertNotIn('-l', build_args)
+
+        eng.run_cli.reset_mock()
+        with mock.patch.object(cli, 'make_engine', return_value=eng), \
+                mock.patch.object(cli, 'bridge_stop'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            cli.cmd_down(argparse.Namespace(target='atrust'))
+        eng.run_cli.assert_called_once_with('stop', '-t', '8', 'zt-atrust', quiet=True)
+
     def test_docker_net_mode_switches_to_subnet_for_accept_all_and_rootless_podman(self):
         # Hostname containing 'podman' must NOT false-positive as Podman on regular Docker!
         docker = engine.DockerEngine()
@@ -1460,13 +1496,25 @@ class Engines(unittest.TestCase):
             self.assertIn('--privileged', flags)
             self.assertNotIn('--cap-add', flags)
 
+        # Rootful Podman (e.g. podman machine / netavark) also uses subnet mode without --privileged.
+        podman_rf = engine.DockerEngine()
+        rf_info = json.dumps({'ServerVersion': '6.0.2', 'SecurityOptions': ['name=selinux']})
+        rf_ver = json.dumps({'Components': [{'Name': 'Podman Engine', 'Version': '6.0.2'}]})
+        with mock.patch.object(podman_rf, 'run_cli', side_effect=[self.answer(rf_info), self.answer(rf_ver)]):
+            rf_flags = podman_rf.container_flags()
+            self.assertTrue(podman_rf.is_podman)
+            self.assertFalse(podman_rf.is_rootless_podman)
+            self.assertEqual(podman_rf.net_mode_for('local'), 'subnet')
+            self.assertNotIn('--privileged', rf_flags)
+            self.assertIn('label=disable', rf_flags)
+
     def test_docker_defaults_to_hardened_least_caps_and_conditional_selinux(self):
         env_clean = {k: v for k, v in os.environ.items() if k != 'ZT_CAPS'}
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.dict(os.environ, {**env_clean, 'ZT_CONFIG': str(Path(tmp) / 'config')}, clear=True):
-            # Non-SELinux Docker (Ubuntu AppArmor / Docker Desktop)
+            # Non-SELinux, non-AppArmor Docker (Docker Desktop / seccomp-only)
             docker = engine.DockerEngine()
-            docker_info = json.dumps({'SecurityOptions': ['name=apparmor', 'name=seccomp,profile=builtin']})
+            docker_info = json.dumps({'SecurityOptions': ['name=seccomp,profile=builtin']})
             with mock.patch.object(docker, 'run_cli', return_value=self.answer(docker_info)):
                 self.assertEqual(docker.resolved_caps(), 'least')
                 flags = docker.container_flags()
@@ -1485,6 +1533,17 @@ class Engines(unittest.TestCase):
             self.assertIn('/run:rw,nosuid,nodev,size=64m', flags)
             self.assertIn('/run/lock:rw,noexec,nosuid,nodev,size=16m', flags)
             self.assertNotIn('label=disable', flags)
+            self.assertNotIn('apparmor=unconfined', flags)
+
+            # Ubuntu/Debian AppArmor Docker adds apparmor=unconfined (needed for mount(2))
+            aa_docker = engine.DockerEngine()
+            aa_info = json.dumps({'SecurityOptions': ['name=apparmor', 'name=seccomp,profile=builtin']})
+            with mock.patch.object(aa_docker, 'run_cli', return_value=self.answer(aa_info)):
+                aa_flags = aa_docker.container_flags()
+                self.assertTrue(aa_docker.has_apparmor)
+            self.assertIn('--security-opt', aa_flags)
+            self.assertIn('apparmor=unconfined', aa_flags)
+            self.assertNotIn('label=disable', aa_flags)
 
             # SELinux Docker adds label=disable only when SELinux is active
             selinux_docker = engine.DockerEngine()
@@ -1494,6 +1553,7 @@ class Engines(unittest.TestCase):
                 self.assertTrue(selinux_docker.has_selinux)
             self.assertIn('--security-opt', se_flags)
             self.assertIn('label=disable', se_flags)
+            self.assertNotIn('apparmor=unconfined', se_flags)
 
             # Explicit CAPS=all still works as opt-in escape hatch without --cap-drop
             all_flags = docker.container_flags('all')

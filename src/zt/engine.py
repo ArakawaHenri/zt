@@ -65,6 +65,21 @@ def named(args):
     )
 
 
+def _error_summary(stderr, stdout):
+    """Extract the most informative error line, ignoring Docker Desktop's advisory footer."""
+    text = ((stderr or '') + '\n' + (stdout or '')).strip()
+    if not text:
+        return ''
+    kept = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "What's next:":
+            break
+        if stripped:
+            kept.append(stripped)
+    return kept[-1] if kept else ''
+
+
 def json_lines(text):
     """Parse newline-delimited JSON objects, skipping blank lines."""
     return [json.loads(line) for line in text.splitlines() if line.strip()]
@@ -270,10 +285,10 @@ class Engine:
             call = lambda: passed_through(self.cli, args, timeout=timeout, env=env)
         proc = tried(call) if retry else call()
         if check and proc.returncode:
-            lines = ((proc.stderr or '') + (proc.stdout or '')).strip().splitlines()
+            detail = _error_summary(proc.stderr, proc.stdout)
             die(
                 f'"{self.cli} {named(args)}" failed'
-                + (f': {lines[-1]}' if lines else f' with exit status {proc.returncode}')
+                + (f': {detail}' if detail else f' with exit status {proc.returncode}')
             )
         return proc
 
@@ -352,7 +367,7 @@ class Engine:
             else:
                 args += ['-e', f'{key}={value}']
         for key, value in labels.items():
-            args += ['-l', f'{key}={value}']
+            args += ['--label', f'{key}={value}']
         if volume:
             args += ['-v', f'{volume}:{STATE_MOUNT}']
         args += ['-p', f'{bind_host}:{port}:6901', ref]
@@ -483,6 +498,7 @@ class DaemonTraits(NamedTuple):
     is_podman: bool = False
     is_rootless: bool = False
     has_selinux: bool = False
+    has_apparmor: bool = False
     is_desktop_vm: bool = False
 
 
@@ -495,10 +511,11 @@ class DockerEngine(Engine):
 
     @functools.cached_property
     def _daemon_traits(self):
-        """Query engine once to detect Podman, rootless mode, SELinux, and VM desktop daemons."""
+        """Query engine once to detect Podman, rootless mode, SELinux/AppArmor, and VM desktops."""
         is_podman = False
         is_rootless = False
         has_selinux = False
+        has_apparmor = False
         is_desktop_vm = False
         info_proc = self.run_cli('info', '--format', '{{json .}}', quiet=True, check=False)
         try:
@@ -512,12 +529,16 @@ class DockerEngine(Engine):
                 is_rootless = True
             if any('selinux' in str(opt).lower() for opt in sec_opts):
                 has_selinux = True
+            if any('apparmor' in str(opt).lower() for opt in sec_opts):
+                has_apparmor = True
             host_info = info.get('Host') if isinstance(info.get('Host'), dict) else {}
             host_sec = host_info.get('Security') if isinstance(host_info.get('Security'), dict) else {}
             if host_sec.get('Rootless'):
                 is_rootless = True
             if host_sec.get('SELinuxEnabled'):
                 has_selinux = True
+            if host_sec.get('AppArmorEnabled'):
+                has_apparmor = True
             if 'docker desktop' in str(info.get('OperatingSystem', '')).lower():
                 is_desktop_vm = True
             if (
@@ -545,6 +566,7 @@ class DockerEngine(Engine):
             is_podman=is_podman,
             is_rootless=is_rootless,
             has_selinux=has_selinux,
+            has_apparmor=has_apparmor,
             is_desktop_vm=is_desktop_vm,
         )
 
@@ -561,6 +583,10 @@ class DockerEngine(Engine):
         return self._daemon_traits.has_selinux
 
     @property
+    def has_apparmor(self):
+        return self._daemon_traits.has_apparmor
+
+    @property
     def is_desktop_vm(self):
         return self._daemon_traits.is_desktop_vm
 
@@ -573,9 +599,10 @@ class DockerEngine(Engine):
         return sys.platform.startswith('linux') and not self.is_rootless and not self.is_desktop_vm
 
     def net_mode_for(self, accept='local'):
-        # Rootless Podman uses gvproxy routed forwarding; Docker in `accept all`
-        # forwards external LAN source IPs via DNAT, so both use subnet mode.
-        return 'subnet' if (self.is_rootless_podman or accept == 'all') else 'gateway'
+        # Podman (rootless & rootful machine/gvproxy) uses routed forwarding, and
+        # Docker in `accept all` forwards external LAN source IPs via DNAT, so both
+        # use subnet mode (still dropping all peer containers & VPN tunnels).
+        return 'subnet' if (self.is_podman or accept == 'all') else 'gateway'
 
     def is_running(self):
         try:
@@ -611,6 +638,10 @@ class DockerEngine(Engine):
         if self.is_rootless_podman or self.has_selinux:
             # systemd requires label=disable when SELinux or rootless Podman confinement is active.
             base += ['--security-opt', 'label=disable']
+        if self.has_apparmor and not self.is_rootless_podman:
+            # Docker's default AppArmor profile denies mount(2) even with CAP_SYS_ADMIN,
+            # blocking systemd, zt-init bind mounts, and netns verification.
+            base += ['--security-opt', 'apparmor=unconfined']
         if self.is_rootless_podman:
             # Rootless Podman cannot pass --device /dev/net/tun or confine CAPS;
             # boot --privileged inside the user namespace without contradictory --cap-add.

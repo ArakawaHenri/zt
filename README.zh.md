@@ -162,7 +162,7 @@ ALL_PROXY=socks5h://kasm_user:<password>@<host>:16912 curl https://internal.corp
 - **`accept local`**：仅监听 `127.0.0.1` 免密访问；在浏览器信任自签 HTTPS 证书后，建议避免在同一浏览器配置中打开不可信网页。
 - **`accept lan`**：同一私网 / 局域网 / Tailscale 网段内设备可免密访问桌面与 SOCKS5，仅适用于可信家庭/办公局域网或加密私网，请勿在公共 Wi-Fi 下开启。
 - **`accept all`**：SOCKS5 RFC 1929 提供账号密码认证，但 SOCKS5 协议本身不带 TLS 加密；跨不可信网络建议配合 Tailscale / WireGuard 等加密隧道使用。
-- **Linux rootful Docker 隔离边界**：在原生 Linux 下使用 rootful Docker 时容器共享宿主机内核（命名空间边界，而非 macOS / Windows 下的虚拟机边界）。`zt` 对 Docker 默认启用 `CAPS=least`（`--cap-drop ALL` + 最小能力白名单，剥离 `SYS_MODULE`、`SYS_RAWIO`、`SYS_PTRACE`、`BPF`、`DAC_READ_SEARCH`、`MKNOD` 等高危能力）、`/dev/net/tun` 仅赋予 `:rw`、`--pids-limit 1024`、收紧 `/run` tmpfs，且仅在检测到 SELinux 时才设置 `label=disable`。在 Linux 上如需额外的用户命名空间隔离层，优先推荐使用 rootless Docker 或 rootless Podman。
+- **Linux rootful Docker 隔离边界**：在原生 Linux 下使用 rootful Docker 时容器共享宿主机内核（命名空间边界，而非 macOS / Windows 下的虚拟机边界）。`zt` 对 Docker 默认启用 `CAPS=least`（`--cap-drop ALL` + 最小能力白名单，剥离 `SYS_MODULE`、`SYS_RAWIO`、`SYS_PTRACE`、`BPF`、`DAC_READ_SEARCH`、`MKNOD` 等高危能力）、`/dev/net/tun` 仅赋予 `:rw`、`--pids-limit 1024`、收紧 `/run` tmpfs，且仅在检测到 SELinux 或 AppArmor 时按需放宽对应 MAC 约束（`label=disable` / `apparmor=unconfined`）以允许 `systemd` 与挂载运行。在 Linux 上如需额外的用户命名空间隔离层，优先推荐使用 rootless Docker 或 rootless Podman。
 - **SOCKS5 UDP 与吞吐边界**：SOCKS5 支持 TCP `CONNECT` 与单播 `UDP ASSOCIATE`（适配 Clash / sing-box / Surge TUN 分流、QUIC、内网 DNS、UDP RPC 等），严格绑定源 IP 与 TCP 控制连接生命周期，TCP 采用单流信用窗口流控（`WINDOW_UPDATE`）确保单条停读连接绝不阻塞其他流或新握手，UDP 采用有界 drop-on-full 队列确保突发流量不拖慢 TCP。组播/广播发现与外部主动入站 P2P UDP 不经过 SOCKS5 与容器防火墙，这类应用请直接使用 KasmVNC 浏览器桌面。所有代理流量复用单条 stdio 管道，适合交互式办公 / SSH / Git / 网页场景，并非面向高吞吐大文件传输设计。
 
 ## 开发与测试

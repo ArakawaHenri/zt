@@ -80,4 +80,11 @@ if [ -d "$STATE_ROOT" ] && mountpoint -q "$STATE_ROOT"; then
     fi
 fi
 
+# Under Docker/Podman with --cgroupns=private and least capabilities (non-privileged),
+# runc/crun mount /sys/fs/cgroup read-only; remount it read-write inside this
+# container's private cgroup namespace so systemd can create its own slices.
+if [ -d /sys/fs/cgroup ] && mountpoint -q /sys/fs/cgroup; then
+    mount -o remount,rw /sys/fs/cgroup 2>/dev/null || true
+fi
+
 exec /lib/systemd/systemd "$@"

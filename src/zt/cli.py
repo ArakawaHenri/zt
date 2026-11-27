@@ -132,7 +132,7 @@ def ensure_container(engine, profile, env, mode, arch=None):
             say(f'{profile}: recreating, {reason} (login state preserved)')
             bridge_stop(profile, engine_cli=engine.cli)
             if info['status']['state'] == 'running':
-                engine.run_cli('stop', '--time', '8', name, quiet=True)
+                engine.run_cli('stop', '-t', '8', name, quiet=True)
             engine.run_cli('rm', '-f', name, quiet=True)
             info = None
             recreated = True
@@ -308,7 +308,7 @@ def cmd_down(args):
     for profile in resolve_targets(args.target):
         bridge_stop(profile, engine_cli=engine.cli)
         if engine.container_state(profile) == 'running':
-            engine.run_cli('stop', '--time', '8', container_name(profile), quiet=True)
+            engine.run_cli('stop', '-t', '8', container_name(profile), quiet=True)
             say(f'{profile}: stopped')
         else:
             say(f'{profile}: not running')
