@@ -1,2 +1,2 @@
 """zt: zero-trust VPN client desktops in Apple Container or Docker."""
-VERSION = '1.2.2'
+VERSION = '1.2.3'
