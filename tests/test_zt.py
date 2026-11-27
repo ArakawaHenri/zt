@@ -26,7 +26,7 @@ SRC = ROOT / 'src'
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from zt import VERSION, bridge, build, cli, config, engine, resources, spec, verify  # noqa: E402
+from zt import VERSION, bridge, build, cli, config, engine, resources, spec, update, verify  # noqa: E402
 from zt.guest import mux as guest_mux  # noqa: E402
 
 if os.name != 'nt':
@@ -226,6 +226,7 @@ class SettingsAndCrossPlatform(unittest.TestCase):
         self.assertIsNone(config.windows_timezone_to_iana('Nonexistent Zone'))
 
         with mock.patch.object(config, '_is_windows', return_value=True), \
+                mock.patch.object(engine.shutil, 'which', side_effect=lambda c: '/usr/bin/docker' if c == 'docker' else None), \
                 mock.patch.dict(
                     os.environ,
                     {'APPDATA': '/fake/roaming', 'LOCALAPPDATA': '/fake/local'},
@@ -234,7 +235,7 @@ class SettingsAndCrossPlatform(unittest.TestCase):
             self.assertEqual(config.config_file(), Path('/fake/roaming/zt/config'))
             self.assertEqual(config.cache_dir(), Path('/fake/local/zt/cache'))
             self.assertEqual(config.state_dir(), Path('/fake/local/zt/state'))
-            self.assertEqual(config.resolve_engine_choice()[0], 'docker')
+            self.assertEqual(engine.resolve_engine()[0].cli, 'docker')
 
     def test_bypass_routes_go_to_trustagent_only(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
@@ -263,7 +264,7 @@ class SettingsAndCrossPlatform(unittest.TestCase):
         with mock.patch.dict(os.environ, {'ZT_ENGINE': 'podman'}), \
                 contextlib.redirect_stderr(io.StringIO()) as err, \
                 self.assertRaises(SystemExit):
-            config.resolve_engine_choice()
+            config.configured_engine()
         self.assertIn("ZT_ENGINE is 'podman'", err.getvalue())
 
     def test_write_setting_is_atomic_with_strict_permissions_and_leaves_no_temp_files(self):
@@ -1575,6 +1576,139 @@ class Engines(unittest.TestCase):
             self.assertEqual(eng.managed_images('base'), ['localhost/zt-base:1.5.2-systemd-arm64-abcdef012345'])
             self.assertEqual(len(eng.managed_images()), 3)
 
+    def test_auto_engine_resolution_follows_running_then_reusable_images_then_container(self):
+        atrust_ref = build.current_ref('atrust', 'arm64')
+        ec_ref = build.current_ref('easyconnect', 'arm64')
+        base_ref = build.current_ref('base', 'arm64')
+
+        def make_fake(cli_name, installed=True, running=False, images=()):
+            eng = mock.Mock(cli=cli_name, display_name=spec.ENGINE_NAMES[cli_name])
+            eng.is_installed.return_value = installed
+            eng.is_running.return_value = running
+            eng.managed_images.return_value = list(images)
+            return eng
+
+        with tempfile.TemporaryDirectory() as tmp:
+            clean_env = {k: v for k, v in os.environ.items() if not k.startswith('ZT_')}
+            clean_env.update({'ZT_STATE': tmp, 'ZT_ARCH': 'arm64'})
+
+            def run_resolve(c_eng, d_eng, extra_env=None):
+                env = {**clean_env, **(extra_env or {})}
+                with mock.patch.dict(os.environ, env, clear=True), \
+                        mock.patch.object(
+                            engine, '_engine_by_name',
+                            side_effect=lambda n: c_eng if n == 'container' else d_eng,
+                        ):
+                    return engine.resolve_engine()
+
+            # 1. Single installed engine (e.g. Linux/Windows without container): zero daemon probes.
+            c1, d1 = make_fake('container', installed=False), make_fake('docker', installed=True)
+            eng, _ = run_resolve(c1, d1)
+            self.assertEqual(eng.cli, 'docker')
+            d1.is_running.assert_not_called()
+
+            # 2. Both installed, only docker running -> picks docker.
+            eng, reason = run_resolve(
+                make_fake('container', installed=True, running=False),
+                make_fake('docker', installed=True, running=True),
+            )
+            self.assertEqual(eng.cli, 'docker')
+            self.assertIn('only running', reason)
+
+            # 3. Both installed, neither running -> prefers container.
+            eng, reason = run_resolve(
+                make_fake('container', installed=True, running=False),
+                make_fake('docker', installed=True, running=False),
+            )
+            self.assertEqual(eng.cli, 'container')
+            self.assertIn('none running', reason)
+
+            # 4. Both running, docker has reusable current client image -> picks docker.
+            eng, reason = run_resolve(
+                make_fake('container', installed=True, running=True, images=()),
+                make_fake('docker', installed=True, running=True, images=(atrust_ref,)),
+            )
+            self.assertEqual(eng.cli, 'docker')
+            self.assertIn('reusing 1 current client image', reason)
+
+            # 5. Both running, docker has 2 current clients vs container's 1 -> picks docker.
+            eng, reason = run_resolve(
+                make_fake('container', installed=True, running=True, images=(atrust_ref, base_ref)),
+                make_fake('docker', installed=True, running=True, images=(atrust_ref, ec_ref, base_ref)),
+            )
+            self.assertEqual(eng.cli, 'docker')
+            self.assertIn('reusing 2 current client images + base', reason)
+
+            # 5b. Tied client count, base image breaks the tie clearly.
+            eng, reason = run_resolve(
+                make_fake('container', installed=True, running=True, images=(atrust_ref,)),
+                make_fake('docker', installed=True, running=True, images=(atrust_ref, base_ref)),
+            )
+            self.assertEqual(eng.cli, 'docker')
+            self.assertIn('reusing 1 current client image + base', reason)
+
+            # 6. Both running, container has reusable base only vs docker's 0 -> picks container.
+            eng, reason = run_resolve(
+                make_fake('container', installed=True, running=True, images=(base_ref,)),
+                make_fake('docker', installed=True, running=True, images=()),
+            )
+            self.assertEqual(eng.cli, 'container')
+            self.assertIn('reusing current base image', reason)
+
+            # 7. Both running and tied on reusable images -> prefers container.
+            eng, reason = run_resolve(
+                make_fake('container', installed=True, running=True, images=(atrust_ref,)),
+                make_fake('docker', installed=True, running=True, images=(atrust_ref,)),
+            )
+            self.assertEqual(eng.cli, 'container')
+            self.assertIn('preferred', reason)
+
+            # 8. Saved engine overrides auto; ZT_ENGINE overrides saved.
+            with mock.patch.dict(os.environ, clean_env, clear=True):
+                config.save_engine('docker')
+            eng, reason = run_resolve(
+                make_fake('container', installed=True, running=True, images=(atrust_ref,)),
+                make_fake('docker', installed=True, running=False),
+            )
+            self.assertEqual(eng.cli, 'docker')
+            self.assertIn('saved in', reason)
+
+            eng, reason = run_resolve(
+                make_fake('container', installed=True, running=True),
+                make_fake('docker', installed=True, running=True),
+                extra_env={'ZT_ENGINE': 'container'},
+            )
+            self.assertEqual(eng.cli, 'container')
+            self.assertEqual(reason, 'from ZT_ENGINE')
+
+    def test_is_running_fails_fast_without_retries_and_managed_images_handles_podman_json(self):
+        apple = engine.AppleContainerEngine()
+        with mock.patch.object(engine.subprocess, 'run', return_value=self.answer('', 1, self.REFUSED)) as srun, \
+                mock.patch.object(engine.time, 'sleep') as msleep:
+            self.assertFalse(apple.is_running())
+        self.assertEqual(srun.call_count, 1)
+        msleep.assert_not_called()
+
+        docker = engine.DockerEngine()
+        with mock.patch.object(
+            engine.subprocess, 'run', side_effect=subprocess.TimeoutExpired(['docker', 'info'], 5)
+        ):
+            self.assertFalse(docker.is_running())
+
+        # Podman emits a JSON array with `Names` rather than Docker NDJSON; errors never die().
+        podman_json = json.dumps([
+            {'Names': ['localhost/zt-atrust:2.5.16.20-arm64-0123456789ab']},
+            {'Names': ['docker.io/library/ubuntu:24.04']},
+        ])
+        with mock.patch.object(
+            docker, 'run_cli',
+            side_effect=[self.answer('', 1), self.answer(podman_json, 0)],
+        ):
+            self.assertEqual(
+                docker.managed_images('atrust'),
+                ['localhost/zt-atrust:2.5.16.20-arm64-0123456789ab'],
+            )
+
     def test_host_listener_supports_ss_and_windows_netstat(self):
         ss_out = subprocess.CompletedProcess(
             [], 0, 'LISTEN 0 128 127.0.0.1:16912 0.0.0.0:* users:(("python3",pid=999,fd=5))\n'
@@ -1594,15 +1728,64 @@ class Engines(unittest.TestCase):
 
 
 class EncapsulatedCLI(unittest.TestCase):
-    def test_public_cli_exposes_only_the_seven_commands(self):
+    def test_public_cli_exposes_only_the_nine_commands(self):
         with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as ex:
             cli.main(['--help'])
         self.assertEqual(ex.exception.code, 0)
         help_text = out.getvalue()
-        for expected in ('up', 'down', 'status', 'doctor', 'purge', 'accept', 'password'):
+        for expected in ('up', 'down', 'status', 'doctor', 'purge', 'accept', 'password', 'use', 'update'):
             self.assertRegex(help_text, rf'\b{expected}\b')
-        for hidden in ('build', 'verify', 'prune', 'socks', 'logs', 'exec', 'shot', 'init', 'use', 'bridge'):
+        for hidden in ('build', 'verify', 'prune', 'socks', 'logs', 'exec', 'shot', 'init', 'bridge'):
             self.assertNotRegex(help_text, rf'^\s+{hidden}\b', f'{hidden} must not be exposed')
+
+    def test_use_command_persists_switches_and_clears_to_auto(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_env = {k: v for k, v in os.environ.items() if not k.startswith('ZT_')}
+            base_env['ZT_STATE'] = tmp
+            with mock.patch.dict(os.environ, base_env, clear=True), \
+                    mock.patch.object(cli.shutil, 'which', side_effect=lambda c: '/usr/bin/docker' if c == 'docker' else None):
+                # Reject installing/saving an engine not on PATH
+                with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                    cli.main(['use', 'container'])
+                self.assertIn('Apple Container is not installed', err.getvalue())
+
+                # Persist docker
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    cli.main(['use', 'docker'])
+                self.assertIn('engine set to docker', out.getvalue())
+                self.assertEqual(config.configured_engine()[0], 'docker')
+
+                # Show active engine
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    cli.main(['use'])
+                self.assertIn('docker (Docker; saved in', out.getvalue())
+
+                # Clear back to auto
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    cli.main(['use', 'auto'])
+                self.assertIn('engine set to auto', out.getvalue())
+                self.assertEqual(config.configured_engine(), (None, 'auto'))
+
+                # Refuse while ZT_ENGINE env override is set (empty ZT_ENGINE counts as unset)
+                with mock.patch.dict(os.environ, {'ZT_ENGINE': ''}), \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    cli.main(['use', 'docker'])
+                self.assertIn('engine set to docker', out.getvalue())
+
+                with mock.patch.dict(os.environ, {'ZT_ENGINE': 'docker'}), \
+                        contextlib.redirect_stderr(io.StringIO()) as err, \
+                        self.assertRaises(SystemExit):
+                    cli.main(['use', 'auto'])
+                self.assertIn('ZT_ENGINE is set in the environment', err.getvalue())
+
+                # Warn when switching while a bridge is still running on the other engine
+                with mock.patch.object(
+                    cli, 'bridge_record',
+                    side_effect=lambda p: (999, 'container', 'local', '', 2) if p == 'atrust' else (None,) * 5,
+                ), contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    cli.main(['use', 'docker'])
+                self.assertIn('atrust still has a running bridge on container', err.getvalue())
 
     def test_password_command_saves_silently_and_accept_all_enforces_password(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2047,6 +2230,190 @@ class Installers(unittest.TestCase):
                     self.assertNotEqual(bad.returncode, 0)
                     self.assertIn('SHA256 mismatch', bad.stderr)
                     self.assertFalse((bad_dir / 'zt').exists())
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_zt_update_verifies_sha256_smoke_tests_and_replaces_atomically(self):
+        # Build a tiny runnable synthetic zipapp claiming version 9.9.9.
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('__main__.py', 'print("zt 9.9.9")\n')
+        new_payload = b'#!/usr/bin/env python3\n' + buf.getvalue()
+        good_sha = hashlib.sha256(new_payload).hexdigest()
+
+        old_buf = io.BytesIO()
+        with zipfile.ZipFile(old_buf, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('__main__.py', f'print("zt {VERSION}")\n')
+        old_payload = b'#!/usr/bin/env python3\n' + old_buf.getvalue()
+
+        state = {'tag': 'v9.9.9', 'tamper': False, 'prerelease': False, 'rate_limit': False, 'dl_paths': []}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                base = f'http://127.0.0.1:{self.server.server_port}'
+                if self.path == '/repos/ArakawaHenri/zt/releases/latest':
+                    if state['rate_limit']:
+                        self.send_response(403)
+                        self.send_header('X-RateLimit-Remaining', '0')
+                        self.end_headers()
+                        return
+                    body = json.dumps({
+                        'tag_name': state['tag'],
+                        'draft': False,
+                        'prerelease': state['prerelease'],
+                        'assets': [
+                            {'name': 'zt', 'browser_download_url': f'{base}/dl/zt'},
+                            {'name': 'zt.pyz', 'browser_download_url': f'{base}/dl/zt.pyz'},
+                            {'name': 'SHA256SUMS', 'browser_download_url': f'{base}/dl/SHA256SUMS'},
+                        ],
+                    }).encode('utf-8')
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path in (
+                    '/dl/zt', '/dl/zt.pyz',
+                    f'/ArakawaHenri/zt/releases/download/{state["tag"]}/zt',
+                    f'/ArakawaHenri/zt/releases/download/{state["tag"]}/zt.pyz',
+                ):
+                    state['dl_paths'].append(self.path)
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(new_payload)))
+                    self.end_headers()
+                    self.wfile.write(new_payload)
+                elif self.path in (
+                    '/dl/SHA256SUMS',
+                    f'/ArakawaHenri/zt/releases/download/{state["tag"]}/SHA256SUMS',
+                ):
+                    state['dl_paths'].append(self.path)
+                    digest = ('0' * 64) if state['tamper'] else good_sha
+                    body = f'{digest}  ./zt\n{digest}  *zt.pyz\n'.encode('utf-8')
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        base_url = f'http://127.0.0.1:{srv.server_port}'
+        try:
+            # Helpers: version normalization & URL scheme guard
+            self.assertEqual(update._compare_versions((1, 2), (1, 2, 0)), 0)
+            self.assertIsNone(update.parse_version('v1.2.0-rc1'))
+            self.assertIsNone(update.parse_version('vv1.2.0'))
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                    contextlib.redirect_stderr(io.StringIO()) as err, \
+                    self.assertRaises(SystemExit):
+                update._validate_url('file:///etc/passwd')
+            self.assertIn('unsupported URL scheme', err.getvalue())
+
+            with tempfile.TemporaryDirectory() as tmp:
+                bin_name = 'zt.pyz' if os.name == 'nt' else 'zt'
+                target = Path(tmp) / bin_name
+                target.write_bytes(old_payload)
+                if os.name != 'nt':
+                    target.chmod(0o755)
+                clean_env = {k: v for k, v in os.environ.items() if not k.startswith('ZT_')}
+                api_env = {**clean_env, 'ZT_API_BASE': base_url}
+
+                # 1. Source checkout refused for install, allowed for --check
+                with mock.patch.dict(os.environ, api_env, clear=True), \
+                        mock.patch.object(update, 'zipapp_archive', return_value=None):
+                    with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                        update.run_update(check_only=False)
+                    self.assertIn('source checkout', err.getvalue())
+                    with contextlib.redirect_stdout(io.StringIO()) as out:
+                        self.assertTrue(update.run_update(check_only=True))
+                    self.assertIn('update available', out.getvalue())
+
+                # 2. Tampered SHA256 rejected without modifying existing binary
+                state['tamper'] = True
+                with mock.patch.dict(os.environ, api_env, clear=True), \
+                        mock.patch.object(update, 'zipapp_archive', return_value=str(target)), \
+                        contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()) as err, \
+                        self.assertRaises(SystemExit):
+                    update.run_update(check_only=False)
+                self.assertIn('SHA256 mismatch', err.getvalue())
+                self.assertEqual(target.read_bytes(), old_payload)
+                self.assertEqual(os.listdir(tmp), [bin_name])
+                state['tamper'] = False
+
+                # 3. Prerelease, non-semver tag, and GitHub rate-limit errors rejected cleanly
+                state['prerelease'] = True
+                with mock.patch.dict(os.environ, api_env, clear=True), \
+                        mock.patch.object(update, 'zipapp_archive', return_value=str(target)), \
+                        contextlib.redirect_stderr(io.StringIO()) as err, \
+                        self.assertRaises(SystemExit):
+                    update.run_update(check_only=False)
+                self.assertIn('not a stable release', err.getvalue())
+                state['prerelease'] = False
+
+                state['tag'] = 'v9.9.9-rc1'
+                with mock.patch.dict(os.environ, api_env, clear=True), \
+                        mock.patch.object(update, 'zipapp_archive', return_value=str(target)), \
+                        contextlib.redirect_stderr(io.StringIO()) as err, \
+                        self.assertRaises(SystemExit):
+                    update.run_update(check_only=False)
+                self.assertIn('not a stable semantic version', err.getvalue())
+                state['tag'] = 'v9.9.9'
+
+                state['rate_limit'] = True
+                with mock.patch.dict(os.environ, api_env, clear=True), \
+                        mock.patch.object(update, 'zipapp_archive', return_value=str(target)), \
+                        contextlib.redirect_stderr(io.StringIO()) as err, \
+                        self.assertRaises(SystemExit):
+                    update.run_update(check_only=True)
+                self.assertIn('rate limit exceeded', err.getvalue())
+                state['rate_limit'] = False
+
+                # 4. Valid update using default browser_download_url (without ZT_DOWNLOAD_BASE)
+                state['dl_paths'].clear()
+                with mock.patch.dict(os.environ, api_env, clear=True), \
+                        mock.patch.object(update, 'zipapp_archive', return_value=str(target)), \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertTrue(update.run_update(check_only=False))
+                self.assertIn(f'updated zt: {VERSION} -> 9.9.9', out.getvalue())
+                self.assertEqual(state['dl_paths'], ['/dl/SHA256SUMS', f'/dl/{bin_name}'])
+                self.assertEqual(target.read_bytes(), new_payload)
+                self.assertEqual(os.listdir(tmp), [bin_name])
+                if os.name != 'nt':
+                    self.assertTrue(target.stat().st_mode & 0o111)
+                ver = subprocess.run([sys.executable, str(target), '--version'], capture_output=True, text=True, check=True)
+                self.assertEqual(ver.stdout.strip(), 'zt 9.9.9')
+
+                # 4b. Explicit ZT_DOWNLOAD_BASE overrides release asset browser_download_url
+                state['dl_paths'].clear()
+                target.write_bytes(old_payload)
+                mirror_env = {**api_env, 'ZT_DOWNLOAD_BASE': base_url}
+                with mock.patch.dict(os.environ, mirror_env, clear=True), \
+                        mock.patch.object(update, 'zipapp_archive', return_value=str(target)), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertTrue(update.run_update(check_only=False))
+                self.assertEqual(
+                    state['dl_paths'],
+                    [
+                        '/ArakawaHenri/zt/releases/download/v9.9.9/SHA256SUMS',
+                        f'/ArakawaHenri/zt/releases/download/v9.9.9/{bin_name}',
+                    ],
+                )
+
+                # 5. Already up to date -> no-op
+                state['tag'] = f'v{VERSION}'
+                with mock.patch.dict(os.environ, api_env, clear=True), \
+                        mock.patch.object(update, 'zipapp_archive', return_value=str(target)), \
+                        contextlib.redirect_stdout(io.StringIO()) as out:
+                    self.assertFalse(update.run_update(check_only=False))
+                self.assertIn('already up to date', out.getvalue())
         finally:
             srv.shutdown()
             srv.server_close()

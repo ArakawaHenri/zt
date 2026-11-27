@@ -1,4 +1,4 @@
-"""Encapsulated 7-command CLI: up, down, status, doctor, purge, accept, password."""
+"""Encapsulated 9-command CLI: up, down, status, doctor, purge, accept, password, use, update."""
 import argparse
 import getpass
 import os
@@ -23,19 +23,21 @@ from zt.config import (
     auth_fingerprint,
     bind_address,
     cache_dir,
+    clear_engine,
     config_file,
     container_env,
     delete_setting,
     die,
     host_timezone,
     password_valid,
+    save_engine,
     say,
     setting,
     target_arch,
     warn,
     write_setting,
 )
-from zt.engine import make_engine, named
+from zt.engine import make_engine, named, resolve_engine
 from zt.spec import (
     ACCEPT_MODES,
     AUTH_USER,
@@ -43,6 +45,7 @@ from zt.spec import (
     CAPABILITIES,
     CLIENTS,
     ENGINE_NAMES,
+    ENGINES,
     all_blob_shas,
     container_name,
     desktop_backend_port,
@@ -53,6 +56,7 @@ from zt.spec import (
     socks_port,
     state_volume_name,
 )
+from zt.update import run_update
 from zt.verify import http_status, verify
 
 
@@ -209,6 +213,50 @@ def cmd_accept(args):
     say(f'accept set to {target} ({_scope_summary(target)}); run "zt up" to apply')
 
 
+def _warn_other_engine_bridges(active_cli):
+    other = [
+        (profile, live_engine)
+        for profile in CLIENTS
+        for live_pid, live_engine, _, _, _ in (bridge_record(profile),)
+        if live_pid and live_engine and live_engine != active_cli
+    ]
+    if other:
+        names = ', '.join(profile for profile, _ in other)
+        engines = ', '.join(sorted({eng for _, eng in other}))
+        warn(
+            f'note: {names} still has a running bridge on {engines}; '
+            f'stop it before running "zt up" on {active_cli}'
+        )
+
+
+def cmd_use(args):
+    if not args.engine:
+        eng, reason = resolve_engine()
+        say(f'{eng.cli} ({eng.display_name}; {reason})')
+        return
+
+    if os.environ.get('ZT_ENGINE'):
+        die('ZT_ENGINE is set in the environment; unset it to persist engine choice instead')
+
+    target = args.engine
+    if target == 'auto':
+        clear_engine()
+        eng, reason = resolve_engine()
+        say(f'engine set to auto -> {eng.cli} ({eng.display_name}; {reason})')
+        _warn_other_engine_bridges(eng.cli)
+        return
+
+    if not shutil.which(target):
+        die(f'{ENGINE_NAMES[target]} is not installed (the `{target}` command was not found)')
+    path = save_engine(target)
+    say(f'engine set to {target} ({ENGINE_NAMES[target]}; saved in {path})')
+    _warn_other_engine_bridges(target)
+
+
+def cmd_update(args):
+    run_update(check_only=getattr(args, 'check', False))
+
+
 def cmd_up(args):
     arch = target_arch()
     engine = make_engine()
@@ -333,7 +381,10 @@ def cmd_status(args=None, engine=None):
     profiles = resolve_targets(target)
 
     auth_summary = f'password ({AUTH_USER})' if auth else ('invalid' if password else 'none')
-    say(f'accept: {mode} ({_scope_summary(mode)}) | auth: {auth_summary} | platform: {platform_for(arch)}')
+    say(
+        f'engine: {engine.cli} | accept: {mode} ({_scope_summary(mode)}) '
+        f'| auth: {auth_summary} | platform: {platform_for(arch)}'
+    )
     say(f'{"client":<12} {"container":<10} {"image":<8} {"desktop":<26} socks')
     foreign = False
     for profile in profiles:
@@ -389,7 +440,10 @@ def cmd_doctor(args):
                 return False
 
     present = engine.is_installed()
-    check(f'{engine.cli} CLI', present, shutil.which(engine.cli) or 'not found')
+    cli_path = shutil.which(engine.cli) or 'not found'
+    reason = getattr(engine, '_choice_reason', '')
+    cli_detail = f'{cli_path} ({reason})' if (present and reason) else cli_path
+    check(f'{engine.cli} CLI', present, cli_detail)
     running = engine.is_running() if present else False
     check(f'{engine.cli} engine', running, '' if running else 'not running')
     check('target platform', True, platform_for(arch))
@@ -567,6 +621,17 @@ def main(argv=None):
         cmd_password,
     )
     pw_cmd.add_argument('--clear', action='store_true', help='remove the saved password (disallowed under accept all)')
+
+    using = commands.add_parser(
+        'use',
+        help='choose container engine: container, docker, or auto; omit argument to show active engine',
+        description='choose container engine: container, docker, or auto; omit argument to show active engine',
+    )
+    using.add_argument('engine', nargs='?', choices=[*ENGINES, 'auto'])
+    using.set_defaults(handler=cmd_use)
+
+    updating = add('update', 'self-update zt to the latest stable GitHub release', cmd_update)
+    updating.add_argument('--check', action='store_true', help='check for a newer release without installing')
 
     args = parser.parse_args(argv)
     if not getattr(args, 'handler', None):

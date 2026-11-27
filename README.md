@@ -11,7 +11,7 @@ English | [中文](README.zh.md)
 Each client gives you a browser-based KasmVNC desktop and a multiplexed SOCKS5 proxy (TCP `CONNECT` + unicast UDP `UDP ASSOCIATE`) into its VPN tunnel, keeping proprietary VPN daemons, kernel routes, DNS hooks, and root certificates off your host OS.
 
 - **Single-file, zero-dependency CLI**: one self-contained Python `zipapp` (`zt` on macOS/Linux, `zt.pyz` on Windows; Python stdlib only, no `git` required).
-- **7 clean commands**: `up`, `down`, `status`, `doctor`, `purge`, `accept`, `password`.
+- **Clean CLI**: `up`, `down`, `status`, `doctor`, `purge`, `accept`, `password`, `use`, `update`.
 - **Passwordless local default**: binds `127.0.0.1` with no password out of the box; switch to `zt accept lan` (source-IP filtered LAN) or `zt accept all` (`0.0.0.0`, password required), and set or clear a password anytime with `zt password [--clear]`.
 - **Persistent login state**: VPN tokens, cookies, device identity (`/etc/machine-id`), and self-signed desktop TLS certs live in per-client engine volumes (`zt-state-<client>`), surviving `zt down`, image upgrades, and `zt accept` / `zt password` switches.
 - **Verified before first use**: every freshly built image is automatically verified against 13 live security & runtime invariants (iptables peer/tunnel drop controls, privilege separation, `NoNewPrivileges`, ELF/library integrity, X11 UI rendering).
@@ -74,13 +74,15 @@ ALL_PROXY=socks5h://127.0.0.1:16912 curl https://internal.corp.example
 ## Commands
 
 ```sh
-zt up [all | client]        build & verify if needed, start clients and SOCKS5 bridges
-zt down [all | client]      stop bridges and containers (keeps login state)
-zt status [all | client]    show accept mode, platform, container state, desktop URLs, and SOCKS5
-zt doctor                   check host engine, platform, settings, images, ports, desktops, and bridges
-zt purge [all | client]     stop and delete containers, login state volumes, built images, and host cache
-zt accept [local|lan|all]   set bind scope (default: local); omit argument to show current mode
-zt password [--clear]       set, change, or clear the password (required for accept all)
+zt up [all | client]            build & verify if needed, start clients and SOCKS5 bridges
+zt down [all | client]          stop bridges and containers (keeps login state)
+zt status [all | client]        show engine, accept mode, platform, desktop URLs, and SOCKS5
+zt doctor                       check host engine, platform, settings, images, ports, desktops, and bridges
+zt purge [all | client]         stop and delete containers, login state volumes, built images, and host cache
+zt accept [local|lan|all]       set bind scope (default: local); omit argument to show current mode
+zt password [--clear]           set, change, or clear the password (required for accept all)
+zt use [container|docker|auto]  choose container engine (default: auto); omit to show active engine
+zt update [--check]             self-update zt to the latest stable GitHub release
 ```
 
 ## Access Modes (`zt accept`)
@@ -122,7 +124,7 @@ To wipe everything for a clean slate (containers, state volumes, built images, a
 |---|---|---|---|
 | Config (`KEY=VALUE`) | `~/.config/zt/config` (`0600`) | `%APPDATA%\zt\config` | `ZT_CONFIG` |
 | SHA256 blob & build cache | `~/.cache/zt` | `%LOCALAPPDATA%\zt\cache` | `ZT_CACHE` |
-| Bridge PIDs & logs | `~/.local/state/zt` | `%LOCALAPPDATA%\zt\state` | `ZT_STATE` |
+| Bridge PIDs, logs & engine | `~/.local/state/zt` | `%LOCALAPPDATA%\zt\state` | `ZT_STATE` |
 
 Settings (each overrideable per invocation via `ZT_<KEY>`):
 

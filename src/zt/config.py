@@ -2,7 +2,6 @@
 import hashlib
 import ipaddress
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -176,11 +175,25 @@ def engine_file():
     return state_dir() / 'engine'
 
 
-def resolve_engine_choice():
-    """Return (engine_name, provenance_description).
+def save_engine(choice):
+    """Atomically persist the selected engine ('container' or 'docker') in engine_file()."""
+    if choice not in ENGINES:
+        die(f'engine must be one of: {", ".join(ENGINES)}')
+    return _write_config_lines(engine_file(), [choice])
 
-    Validates explicit ZT_ENGINE overrides strictly instead of silently falling
-    back, and falls back to saved engine or auto-detection.
+
+def clear_engine():
+    """Remove saved engine preference so `auto` selection applies."""
+    path = engine_file()
+    existed = path.exists()
+    path.unlink(missing_ok=True)
+    return path, existed
+
+
+def configured_engine():
+    """Return (engine_name, provenance) when explicitly pinned via ZT_ENGINE or saved file.
+
+    Returns (None, 'auto') when engine selection is in automatic mode.
     """
     override = os.environ.get('ZT_ENGINE')
     if override:
@@ -197,9 +210,7 @@ def resolve_engine_choice():
         return saved, f'saved in {path}'
     if saved:
         warn(f'zt: ignoring unknown engine {saved!r} in {path}')
-
-    detected = 'container' if (not _is_windows() and shutil.which('container')) else 'docker'
-    return detected, 'auto-detected (not saved)'
+    return None, 'auto'
 
 
 def parse_config(text):

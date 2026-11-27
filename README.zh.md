@@ -11,7 +11,7 @@
 每个客户端提供一个基于 KasmVNC 的浏览器桌面和一条直通 VPN 隧道的多路复用 SOCKS5 代理端口（支持 TCP `CONNECT` 与单播 UDP `UDP ASSOCIATE`），彻底隔离厂商后台常驻服务、全局路由劫持、DNS 篡改与系统根证书污染。
 
 - **零依赖单文件分发**：除 Python 3 解释器外零第三方依赖、无需 `git`，单文件 `zipapp`（macOS / Linux 为 `zt`，Windows 为 `zt.pyz`）。
-- **极简 7 命令封装**：仅暴露 `up`、`down`、`status`、`doctor`、`purge`、`accept`、`password`。
+- **极简命令封装**：仅暴露 `up`、`down`、`status`、`doctor`、`purge`、`accept`、`password`、`use`、`update`。
 - **默认本机免密**：默认仅监听 `127.0.0.1` 且无需密码，开箱即用；按需切换 `zt accept lan`（宿主机源 IP 过滤的局域网模式）或 `zt accept all`（`0.0.0.0` 全网监听，必填密码），并可随时通过 `zt password [--clear]` 设密或清密。
 - **重建容器不丢登录态**：VPN 登录凭据、Cookie、设备指纹（`/etc/machine-id`）与自签桌面 TLS 证书保存在独立数据卷（`zt-state-<client>`），执行 `zt down`、升级镜像、切换 `zt accept` 或修改密码重建容器时自动保留。
 - **先验后用**：每个新构建镜像首次启动前自动执行 13 项实机安全与运行不变量校验（iptables 隔离正反对照实验、最小权限与 `NoNewPrivileges`、ELF 架构与动态库完整性、X11 窗口渲染等）。
@@ -74,13 +74,15 @@ ALL_PROXY=socks5h://127.0.0.1:16912 curl https://internal.corp.example
 ## 命令一览
 
 ```sh
-zt up [all | client]        按需构建与校验镜像，启动容器和 SOCKS5 桥接
-zt down [all | client]      停止桥接与容器（保留登录态）
-zt status [all | client]    查看访问模式、目标架构、容器状态、桌面地址与 SOCKS5 端口
-zt doctor                   全面体检容器引擎、架构、配置、镜像、端口、桌面与桥接状态
-zt purge [all | client]     停止并删除容器、登录态数据卷、已构建镜像与宿主机缓存
-zt accept [local|lan|all]   设置允许访问范围（默认 local）；无参数时显示当前模式
-zt password [--clear]       设置、修改或清除密码（accept all 模式下必填）
+zt up [all | client]            按需构建与校验镜像，启动容器和 SOCKS5 桥接
+zt down [all | client]          停止桥接与容器（保留登录态）
+zt status [all | client]        查看容器引擎、访问模式、目标架构、桌面地址与 SOCKS5 端口
+zt doctor                       全面体检容器引擎、架构、配置、镜像、端口、桌面与桥接状态
+zt purge [all | client]         停止并删除容器、登录态数据卷、已构建镜像与宿主机缓存
+zt accept [local|lan|all]       设置允许访问范围（默认 local）；无参数时显示当前模式
+zt password [--clear]           设置、修改或清除密码（accept all 模式下必填）
+zt use [container|docker|auto]  选择容器引擎（默认 auto）；无参数时显示当前引擎
+zt update [--check]             在线自更新到最新稳定版 GitHub Release
 ```
 
 ## 访问范围与认证（`zt accept`）
@@ -122,7 +124,7 @@ ALL_PROXY=socks5h://kasm_user:<password>@<host>:16912 curl https://internal.corp
 |---|---|---|---|
 | 配置文件（`KEY=VALUE`） | `~/.config/zt/config`（`0600`） | `%APPDATA%\zt\config` | `ZT_CONFIG` |
 | SHA256 安装包与构建缓存 | `~/.cache/zt` | `%LOCALAPPDATA%\zt\cache` | `ZT_CACHE` |
-| 桥接 PID 与日志 | `~/.local/state/zt` | `%LOCALAPPDATA%\zt\state` | `ZT_STATE` |
+| 桥接 PID、日志与引擎选择 | `~/.local/state/zt` | `%LOCALAPPDATA%\zt\state` | `ZT_STATE` |
 
 可用配置项（均可通过 `ZT_<KEY>` 环境变量单次覆盖）：
 

@@ -14,14 +14,16 @@ import threading
 import time
 from typing import NamedTuple
 
-from zt.config import die, resolve_engine_choice, setting, target_arch, warn
+from zt.config import configured_engine, die, setting, target_arch, warn
 from zt.spec import (
     CAPABILITIES,
     CLIENTS,
     DOCKER_LEAST_CAPS,
     ENGINE_NAMES,
+    ENGINES,
     STATE_MOUNT,
     container_name,
+    host_arch,
     platform_for,
 )
 
@@ -257,17 +259,16 @@ class Engine:
     def net_mode_for(self, accept='local'):
         return 'subnet' if self.is_rootless_podman else 'gateway'
 
-    def run_cli(self, *args, quiet=False, check=True, timeout=None, env=None):
+    def run_cli(self, *args, quiet=False, check=True, timeout=None, env=None, retry=True):
         if quiet:
-            proc = tried(
-                lambda: subprocess.run(
-                    [self.cli, *args],
-                    capture_output=True, text=True, errors='replace',
-                    timeout=timeout, env=env,
-                )
+            call = lambda: subprocess.run(
+                [self.cli, *args],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, errors='replace',
+                timeout=timeout, env=env,
             )
         else:
-            proc = tried(lambda: passed_through(self.cli, args, timeout=timeout, env=env))
+            call = lambda: passed_through(self.cli, args, timeout=timeout, env=env)
+        proc = tried(call) if retry else call()
         if check and proc.returncode:
             lines = ((proc.stderr or '') + (proc.stdout or '')).strip().splitlines()
             die(
@@ -396,12 +397,14 @@ class AppleContainerEngine(Engine):
 
     def is_running(self):
         try:
-            status = json.loads(
-                self.run_cli('system', 'status', '--format', 'json', quiet=True, check=False).stdout
+            proc = self.run_cli(
+                'system', 'status', '--format', 'json',
+                quiet=True, check=False, timeout=5, retry=False,
             )
-        except ValueError:
+            status = json.loads(proc.stdout) if proc.returncode == 0 else {}
+        except (OSError, subprocess.TimeoutExpired, ValueError):
             return False
-        return status.get('status') == 'running'
+        return isinstance(status, dict) and status.get('status') == 'running'
 
     def container_flags(self, caps_override=None):
         adds = self._cap_flags(caps_override)
@@ -450,10 +453,16 @@ class AppleContainerEngine(Engine):
 
     def managed_images(self, profile=None):
         try:
-            records = json.loads(
-                self.run_cli('image', 'ls', '--format', 'json', quiet=True).stdout
+            proc = self.run_cli(
+                'image', 'ls', '--format', 'json',
+                quiet=True, check=False, timeout=15, retry=False,
             )
-        except (ValueError, KeyError, TypeError):
+            if proc.returncode != 0:
+                return []
+            records = json.loads(proc.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+            return []
+        if not isinstance(records, list):
             return []
         found = set()
         for record in records:
@@ -569,10 +578,16 @@ class DockerEngine(Engine):
         return 'subnet' if (self.is_rootless_podman or accept == 'all') else 'gateway'
 
     def is_running(self):
-        return (
-            self.run_cli('info', '--format', '{{.ServerVersion}}', quiet=True, check=False).returncode
-            == 0
-        )
+        try:
+            return (
+                self.run_cli(
+                    'info', '--format', '{{.ServerVersion}}',
+                    quiet=True, check=False, timeout=5, retry=False,
+                ).returncode
+                == 0
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
 
     def _cap_flags(self, caps_override=None):
         caps = self.resolved_caps(caps_override)
@@ -662,27 +677,116 @@ class DockerEngine(Engine):
         filter_args = ['--filter', 'label=org.zt.managed=true']
         if profile is not None:
             filter_args += ['--filter', f'label=org.zt.profile={profile}']
-        labeled = self.run_cli(
-            'image', 'ls', *filter_args,
-            '--format', '{{.Repository}}:{{.Tag}}', quiet=True, check=False,
-        )
-        if labeled.returncode == 0:
-            for line in labeled.stdout.splitlines():
-                ref = line.strip()
-                if ref and '<none>' not in ref:
-                    found.add(ref)
         try:
-            records = json_lines(self.run_cli('image', 'ls', '--format', 'json', quiet=True).stdout)
-            for record in records:
-                ref = f"{record.get('Repository')}:{record.get('Tag')}"
-                if _MANAGED_TAG_RE.fullmatch(ref) and _matches_profile(ref, {}, profile):
-                    found.add(ref)
-        except (ValueError, KeyError, TypeError):
+            labeled = self.run_cli(
+                'image', 'ls', *filter_args,
+                '--format', '{{.Repository}}:{{.Tag}}',
+                quiet=True, check=False, timeout=15, retry=False,
+            )
+            if labeled.returncode == 0:
+                for line in labeled.stdout.splitlines():
+                    ref = line.strip()
+                    if ref and '<none>' not in ref:
+                        found.add(ref)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            proc = self.run_cli(
+                'image', 'ls', '--format', 'json',
+                quiet=True, check=False, timeout=15, retry=False,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                raw = proc.stdout.strip()
+                if raw.startswith('['):
+                    parsed = json.loads(raw)
+                    records = parsed if isinstance(parsed, list) else []
+                else:
+                    records = json_lines(raw)
+                for record in records:
+                    if not isinstance(record, dict):
+                        continue
+                    refs = []
+                    if record.get('Repository') and record.get('Tag'):
+                        refs.append(f"{record['Repository']}:{record['Tag']}")
+                    for name in record.get('Names') or ():
+                        if isinstance(name, str):
+                            refs.append(name)
+                    for ref in refs:
+                        if _MANAGED_TAG_RE.fullmatch(ref) and _matches_profile(ref, {}, profile):
+                            found.add(ref)
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError):
             pass
         return sorted(found)
 
 
+def _engine_by_name(name):
+    return DockerEngine() if name == 'docker' else AppleContainerEngine()
+
+
+def _reusable_image_score(eng):
+    """Count current (client_images, base_image) already built in `eng` for the active arch."""
+    from zt.build import current_ref
+
+    try:
+        arch = host_arch()
+    except ValueError:
+        return 0, 0
+    have = set(eng.managed_images())
+    client_refs = {current_ref(profile, arch) for profile in CLIENTS}
+    base_ref = current_ref('base', arch)
+    return len(have & client_refs), 1 if base_ref in have else 0
+
+
+def resolve_engine(choice=None):
+    """Select an Engine instance and human-readable provenance.
+
+    In `auto` mode (no ZT_ENGINE override and no saved choice), selection uses no
+    OS special-casing:
+      1. Installed engines on PATH (`container`, `docker`);
+      2. Among installed engines, prefer one whose daemon is currently running;
+      3. If multiple daemons are running, prefer the one with more reusable
+         current images (client images first, then base image);
+      4. Final tie-break prefers `container` (Apple Container) over `docker`.
+    """
+    if choice is not None:
+        return _engine_by_name(choice), 'explicit'
+
+    pinned, reason = configured_engine()
+    if pinned is not None:
+        return _engine_by_name(pinned), reason
+
+    candidates = [_engine_by_name(name) for name in ENGINES]
+    installed = [eng for eng in candidates if eng.is_installed()]
+    if not installed:
+        return DockerEngine(), 'auto: none installed'
+    if len(installed) == 1:
+        return installed[0], 'auto'
+
+    running = [eng for eng in installed if eng.is_running()]
+    if len(running) == 1:
+        return running[0], 'auto: only running engine'
+    if not running:
+        return installed[0], 'auto: preferred, none running'
+
+    scores = {eng.cli: _reusable_image_score(eng) for eng in running}
+    if len(set(scores.values())) > 1:
+        winner = max(running, key=lambda eng: scores[eng.cli])
+        clients_hit, base_hit = scores[winner.cli]
+        if clients_hit:
+            noun = 'client image' if clients_hit == 1 else 'client images'
+            detail = f'reusing {clients_hit} current {noun}' + (' + base' if base_hit else '')
+        elif base_hit:
+            detail = 'reusing current base image'
+        else:
+            detail = 'reusing current images'
+        return winner, f'auto: {detail}'
+
+    # Tied on running state & reusable current images: prefer `container` (ENGINES[0]).
+    return running[0], 'auto: preferred'
+
+
 def make_engine(choice=None):
     """Instantiate the selected Engine implementation."""
-    name = choice if choice is not None else resolve_engine_choice()[0]
-    return DockerEngine() if name == 'docker' else AppleContainerEngine()
+    eng, reason = resolve_engine(choice)
+    eng._choice_reason = reason
+    return eng
