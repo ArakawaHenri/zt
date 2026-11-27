@@ -8,7 +8,7 @@ English | [中文](README.zh.md)
 
 **zt** runs enterprise zero-trust VPN clients — **Qianxin TrustAgent**, **Sangfor aTrust**, and **Sangfor EasyConnect** — inside isolated Linux containers on **macOS**, **Linux**, and **Windows** (`arm64` & `amd64`).
 
-Each client gives you a browser-based KasmVNC desktop and a multiplexed SOCKS5 proxy into its VPN tunnel, keeping proprietary VPN daemons, kernel routes, DNS hooks, and root certificates off your host OS.
+Each client gives you a browser-based KasmVNC desktop and a multiplexed SOCKS5 proxy (TCP `CONNECT` + unicast UDP `UDP ASSOCIATE`) into its VPN tunnel, keeping proprietary VPN daemons, kernel routes, DNS hooks, and root certificates off your host OS.
 
 - **Single-file, zero-dependency CLI**: one self-contained Python `zipapp` (`zt` on macOS/Linux, `zt.pyz` on Windows; Python stdlib only, no `git` required).
 - **7 clean commands**: `up`, `down`, `status`, `doctor`, `purge`, `accept`, `password`.
@@ -129,7 +129,7 @@ Settings (each overrideable per invocation via `ZT_<KEY>`):
 - `ACCEPT`: `local` (default), `lan`, or `all`.
 - `VNC_PW`: 6–8 character password set via `zt password` (used when `ACCEPT=all`).
 - `TRUSTAGENT_BYPASS_ROUTES`: optional comma-separated CIDRs routed via the container's default gateway instead of the TrustAgent VPN tunnel (`table 100 bypass`).
-- `CAPS`: root capability profile — `all` (default) or `least` (`NET_ADMIN` + `SYS_ADMIN`).
+- `CAPS`: root capability profile — defaults to `least` on Docker (`--cap-drop ALL` + explicit minimal allowlist, `:rw` `/dev/net/tun`, `--pids-limit 1024`) and `all` on Apple Container (per-container microVM); override with `least` or `all`.
 - `ZT_ENGINE`: per-call engine override (`container` or `docker`).
 - `ZT_ARCH`: per-call target container architecture override (`arm64` or `amd64`).
 
@@ -155,11 +155,13 @@ Before any newly built image is started, `zt` boots it once on loopback and veri
 - **Privilege separation (`privilege`, `setuid`, `ownership`, `programs`)**: no `sudo` in base; all desktop UIs run as `kasm-user` with `CapEff=0` and `NoNewPrivs=1`; every systemd unit enforces `NoNewPrivileges=true`; root-executed paths and symlink chains are audited; `kasm-user` owns nothing outside `/home/kasm-user` and declared vendor shared directories.
 - **Runtime integrity (`units`, `ui`, `libraries`, `timezone`, `log`)**: active units, live X11 window checks, native ELF `e_machine` + `ldd` verification, host timezone sync, and clean boot logs.
 
-### Trust Boundaries
+### Trust Boundaries & Architectural Limits
 
 - **`accept local`**: passwordless on `127.0.0.1` for frictionless local use; avoid untrusted web pages in the same browser profile after trusting the self-signed HTTPS certificate.
 - **`accept lan`**: passwordless for any peer on the same private/LAN/Tailscale subnet; use only on trusted home/office networks or private overlays, not shared public Wi-Fi.
 - **`accept all`**: SOCKS5 RFC 1929 enforces password authentication, but SOCKS5 itself is not TLS-encrypted; prefer `accept lan` or an encrypted overlay (Tailscale / WireGuard) over untrusted networks.
+- **Linux rootful Docker**: on native Linux with rootful Docker, containers share the host kernel (namespace boundary rather than a VM like macOS Apple Container or Docker Desktop). `zt` defaults Docker to `CAPS=least` (`--cap-drop ALL` + explicit minimal allowlist, excluding `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `BPF`, `DAC_READ_SEARCH`, `MKNOD`, etc.), mounts `/dev/net/tun` read-write only (`:rw`), enforces `--pids-limit 1024`, hardens `/run` tmpfs mounts, and only sets `label=disable` when SELinux is active. For an additional user-namespace boundary on Linux, prefer rootless Docker or rootless Podman.
+- **SOCKS5 UDP & throughput**: SOCKS5 supports TCP `CONNECT` and unicast `UDP ASSOCIATE` (for TUN clients such as Clash/sing-box/Surge, QUIC, internal DNS, and UDP RPC), with peer-IP enforcement, TCP-control lifecycle binding, per-stream TCP credit flow control (`WINDOW_UPDATE`) so a stalled client never blocks other streams or new handshakes, and drop-on-full bounded UDP queues so UDP bursts never stall TCP streams. Multicast/broadcast discovery and unsolicited inbound P2P UDP do not traverse SOCKS5 or the container firewall — use the KasmVNC web desktop for such apps. Traffic shares a single multiplexed stdio pipe, optimized for interactive office/SSH/Git/web workloads rather than bulk high-throughput transfers.
 
 ## Development
 

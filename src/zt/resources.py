@@ -6,7 +6,8 @@ from pathlib import Path
 from zt.spec import EXECUTABLE_OVERLAYS
 
 
-def _zipapp_archive():
+def zipapp_archive():
+    """Return path to the running zipapp archive, or None when running from a source checkout."""
     spec = globals().get('__spec__')
     loader = getattr(spec, 'loader', None)
     archive = getattr(loader, 'archive', None)
@@ -28,7 +29,7 @@ def _checkout_mode(rel_posix, path):
 
 def overlay_files():
     """Return {relative_posix_path: (bytes, posix_mode)} for all files under overlay/."""
-    archive = _zipapp_archive()
+    archive = zipapp_archive()
     if archive:
         files = {}
         with zipfile.ZipFile(archive, 'r') as zf:
@@ -51,7 +52,7 @@ def overlay_files():
 
 def guest_script(name):
     """Return UTF-8 source text of src/zt/guest/<name>.py."""
-    archive = _zipapp_archive()
+    archive = zipapp_archive()
     member = f'zt/guest/{name}.py'
     if archive:
         with zipfile.ZipFile(archive, 'r') as zf:

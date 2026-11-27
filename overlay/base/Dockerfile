@@ -53,5 +53,6 @@ ENV DISPLAY=:1 \
 
 EXPOSE 6901
 WORKDIR /home/kasm-user
-USER 1000
+# PID 1 (systemd) must start as root; individual units drop to kasm-user/nobody with NoNewPrivileges.
+USER root
 ENTRYPOINT ["/lib/systemd/systemd"]

@@ -5,6 +5,7 @@ SHELL_SCRIPTS := \
 	overlay/base/rootfs/usr/local/bin/zt-kasmvnc.sh \
 	overlay/common/rootfs/usr/local/bin/zt-init \
 	overlay/common/rootfs/usr/local/bin/zt-net-setup.sh \
+	overlay/sangfor/common/install-deb.sh \
 	overlay/sangfor/common/rootfs/usr/bin/xdg-open \
 	overlay/sangfor/atrust/rootfs/usr/bin/loginctl \
 	overlay/sangfor/atrust/rootfs/usr/sbin/sysctl-hook \

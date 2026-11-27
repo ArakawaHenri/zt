@@ -289,13 +289,22 @@ def check_setuid(expected, root='/'):
 
 
 def start_stand_in(port):
-    """Spawn a detached dual-stack TCP listener that stays up for external probes."""
+    """Spawn detached dual-stack TCP + UDP echo listeners for live positive/negative probes."""
     code = (
-        'import socket, sys\n'
+        'import socket, sys, threading\n'
+        'port = int(sys.argv[1])\n'
+        'u = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)\n'
+        'u.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)\n'
+        'u.bind(("::", port))\n'
+        'def serve_udp():\n'
+        '    while True:\n'
+        '        data, addr = u.recvfrom(2048)\n'
+        '        u.sendto(b"pong:" + data, addr)\n'
+        'threading.Thread(target=serve_udp, daemon=True).start()\n'
         's = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)\n'
         's.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n'
         's.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)\n'
-        's.bind(("::", int(sys.argv[1])))\n'
+        's.bind(("::", port))\n'
         's.listen(32)\n'
         'while True:\n'
         '    c, _ = s.accept()\n'
@@ -313,7 +322,11 @@ def start_stand_in(port):
     while time.monotonic() < deadline:
         try:
             with socket.create_connection(('127.0.0.1', port), timeout=0.5):
-                return True
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                    probe.settimeout(0.5)
+                    probe.sendto(b'hi', ('127.0.0.1', port))
+                    if probe.recvfrom(64)[0] == b'pong:hi':
+                        return True
         except OSError:
             time.sleep(0.1)
     return False
@@ -516,15 +529,28 @@ def check_policy(net_mode):
     return True, ''
 
 
-def _probe_from_netns(ns, host, port):
-    code = (
-        'import socket, sys\n'
-        'try:\n'
-        '    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3).close()\n'
-        '    print("through")\n'
-        'except OSError:\n'
-        '    print("stopped")\n'
-    )
+def _probe_from_netns(ns, host, port, proto='tcp'):
+    if proto == 'udp':
+        code = (
+            'import socket, sys\n'
+            'af = socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET\n'
+            'try:\n'
+            '    s = socket.socket(af, socket.SOCK_DGRAM)\n'
+            '    s.settimeout(2.0)\n'
+            '    s.sendto(b"zt", (sys.argv[1], int(sys.argv[2])))\n'
+            '    print("through" if s.recvfrom(64)[0] == b"pong:zt" else "stopped")\n'
+            'except OSError:\n'
+            '    print("stopped")\n'
+        )
+    else:
+        code = (
+            'import socket, sys\n'
+            'try:\n'
+            '    socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3).close()\n'
+            '    print("through")\n'
+            'except OSError:\n'
+            '    print("stopped")\n'
+        )
     proc = _run(['ip', 'netns', 'exec', ns, sys.executable, '-c', code, host, str(port)], timeout=10)
     return proc.stdout.strip() or 'stopped'
 
@@ -542,12 +568,14 @@ def check_tunnel(stand_in_port, net_mode):
 
     def run_probes():
         targets = [
-            ('desktop over IPv4', '10.254.0.1', 6901),
-            ('stand-in over IPv4', '10.254.0.1', stand_in_port),
-            ('stand-in over IPv6', 'fd99::1', stand_in_port),
+            ('desktop over IPv4', '10.254.0.1', 6901, 'tcp'),
+            ('stand-in over IPv4', '10.254.0.1', stand_in_port, 'tcp'),
+            ('stand-in over IPv6', 'fd99::1', stand_in_port, 'tcp'),
+            ('stand-in UDP over IPv4', '10.254.0.1', stand_in_port, 'udp'),
+            ('stand-in UDP over IPv6', 'fd99::1', stand_in_port, 'udp'),
         ]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-            futs = [(label, pool.submit(_probe_from_netns, ns, h, p)) for label, h, p in targets]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
+            futs = [(label, pool.submit(_probe_from_netns, ns, h, p, proto)) for label, h, p, proto in targets]
             return {label: fut.result() for label, fut in futs}
 
     before_count = tunnel_rule_count()
@@ -574,12 +602,13 @@ def check_tunnel(stand_in_port, net_mode):
 
         with_rules = run_probes()
         for tool in ('iptables', 'ip6tables'):
-            rem = _run([
-                tool, '-t', 'filter', '-D', 'ZT-INPUT', '-i', 'utun+', '-p', 'tcp',
-                '-m', 'comment', '--comment', 'zt: tunnel', '-j', 'DROP',
-            ])
-            if rem.returncode != 0:
-                return False, f'could not remove {tool} tunnel rule for control: {_flat(rem.stderr, 120)}'
+            for proto, comment in (('tcp', 'zt: tunnel'), ('udp', 'zt: tunnel udp')):
+                rem = _run([
+                    tool, '-t', 'filter', '-D', 'ZT-INPUT', '-i', 'utun+', '-p', proto,
+                    '-m', 'comment', '--comment', comment, '-j', 'DROP',
+                ])
+                if rem.returncode != 0:
+                    return False, f'could not remove {tool} {proto} tunnel rule for control: {_flat(rem.stderr, 120)}'
         without_rules = run_probes()
     finally:
         env = dict(os.environ, ZT_NET_MODE=net_mode)

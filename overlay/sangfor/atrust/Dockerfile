@@ -30,26 +30,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends --no-install-su
 COPY --from=shims /usr/local/lib/fake-getlogin.so /usr/local/lib/fake-getlogin.so
 COPY ./rootfs/usr/bin/loginctl /usr/bin/loginctl
 COPY ./rootfs/usr/sbin/sysctl-hook /usr/sbin/sysctl-hook
+COPY ./install-deb.sh /tmp/install-deb.sh
 COPY ./blobs/atrust.deb /tmp/atrust.deb
 
 # Unpack the official Sangfor aTrust .deb and run its maintainer scripts.
 # sysctl-hook and loginctl must be in place before postinst runs.
-RUN chmod 0755 /usr/bin/loginctl /usr/sbin/sysctl-hook \
+RUN chmod 0755 /usr/bin/loginctl /usr/sbin/sysctl-hook /tmp/install-deb.sh \
     && mv /usr/sbin/sysctl /usr/sbin/sysctl.real \
     && ln -s /usr/sbin/sysctl-hook /usr/sbin/sysctl \
-    && dpkg-deb -R /tmp/atrust.deb / \
-    && pkg=$(awk -F': *' '/^Package:/ {print $2; exit}' /DEBIAN/control) \
-    && ([ ! -x /DEBIAN/preinst ] || /DEBIAN/preinst || true) \
-    && mkdir -p "/var/lib/dpkg/info/$pkg" \
-    && for f in /DEBIAN/*; do \
-           cp "$f" "/var/lib/dpkg/info/$pkg.$(basename "$f")"; \
-           cp "$f" "/var/lib/dpkg/info/$(basename "$f")"; \
-       done \
-    && "/var/lib/dpkg/info/$pkg.postinst" \
-    && for f in /DEBIAN/*; do \
-           rm -f "/var/lib/dpkg/info/$(basename "$f")"; \
-       done \
-    && rm -rf /DEBIAN /tmp/atrust.deb \
+    && /tmp/install-deb.sh /tmp/atrust.deb \
+    && rm -f /tmp/install-deb.sh \
     && ([ ! -e /home/sangfor ] || chown -R sangfor:sangfor /home/sangfor) \
     && ln -fs /bin/false /usr/sbin/dmidecode \
     && chmod a-s /usr/share/sangfor/aTrust/uem/bin/uem_installer \
@@ -70,5 +60,6 @@ RUN chmod 0755 /usr/local/bin/zt-init /usr/local/bin/zt-net-setup.sh \
     && chmod -R o-w /home/kasm-user \
     && systemctl enable zt-net.service zt-sangfor.service zt-socks.service
 
-USER 1000
+# PID 1 (zt-init -> systemd) starts as root; desktop and SOCKS units run unprivileged.
+USER root
 ENTRYPOINT ["/usr/local/bin/zt-init"]

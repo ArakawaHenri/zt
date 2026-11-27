@@ -33,31 +33,22 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
         /etc/apt/sources.list.d/zt-bookworm.list /etc/apt/preferences.d/zt-bookworm
 
+COPY ./install-deb.sh /tmp/install-deb.sh
 COPY ./blobs/easyconnect.pkg /tmp/easyconnect.pkg
 COPY ./blobs/electron.zip /tmp/electron.zip
 
 # Unpack the official Sangfor EasyConnect package (.zip on arm64 or direct .deb
 # on amd64), run its maintainer scripts, replace its bundled Electron binary
 # with official Electron 1.8.8, and restore root ownership over system paths.
-RUN if [ -n "${VPN_DEB_PATH}" ]; then \
+RUN chmod 0755 /tmp/install-deb.sh \
+    && if [ -n "${VPN_DEB_PATH}" ]; then \
         busybox unzip -p /tmp/easyconnect.pkg "${VPN_DEB_PATH}" > /tmp/vpn.deb; \
         rm -f /tmp/easyconnect.pkg; \
     else \
         mv /tmp/easyconnect.pkg /tmp/vpn.deb; \
     fi \
-    && dpkg-deb -R /tmp/vpn.deb / \
-    && pkg=$(awk -F': *' '/^Package:/ {print $2; exit}' /DEBIAN/control) \
-    && ([ ! -x /DEBIAN/preinst ] || /DEBIAN/preinst || true) \
-    && mkdir -p "/var/lib/dpkg/info/$pkg" \
-    && for f in /DEBIAN/*; do \
-           cp "$f" "/var/lib/dpkg/info/$pkg.$(basename "$f")"; \
-           cp "$f" "/var/lib/dpkg/info/$(basename "$f")"; \
-       done \
-    && "/var/lib/dpkg/info/$pkg.postinst" \
-    && for f in /DEBIAN/*; do \
-           rm -f "/var/lib/dpkg/info/$(basename "$f")"; \
-       done \
-    && rm -rf /DEBIAN /tmp/vpn.deb \
+    && /tmp/install-deb.sh /tmp/vpn.deb \
+    && rm -f /tmp/install-deb.sh \
     && ln -fs /bin/false /usr/sbin/dmidecode \
     && rm -f /usr/share/sangfor/EasyConnect/resources/conf/easy_connect.json \
     && mv /usr/share/sangfor/EasyConnect/resources/conf /usr/share/sangfor/EasyConnect/resources/conf_backup \
@@ -93,5 +84,6 @@ RUN chmod 0755 /usr/local/bin/zt-init /usr/local/bin/zt-net-setup.sh \
     && chmod -R o-w /home/kasm-user \
     && systemctl enable zt-net.service zt-sangfor.service zt-socks.service
 
-USER 1000
+# PID 1 (zt-init -> systemd) starts as root; desktop and SOCKS units run unprivileged.
+USER root
 ENTRYPOINT ["/usr/local/bin/zt-init"]

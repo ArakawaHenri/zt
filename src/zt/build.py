@@ -224,11 +224,11 @@ def build_context(name, arch=None):
     return context, digest
 
 
-def build(engine, name, force=False, arch=None):
-    """Build `name` if missing (or forced), returning its content-addressed image ref."""
+def build(engine, name, force=False, arch=None, tag=None):
+    """Build `name` if missing (or forced), returning its image ref (or custom `tag`)."""
     arch = arch or target_arch()
     spec = spec_of(name)
-    ref = current_ref(name, arch)
+    ref = tag or current_ref(name, arch)
     if engine.image_exists(ref) and not force:
         say(f'{name}: image up to date ({ref})')
         return ref

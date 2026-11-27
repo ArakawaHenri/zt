@@ -16,13 +16,6 @@ esac
 mkdir -p "$HOME/.vnc"
 chmod 700 "$HOME/.vnc"
 
-if [ ! -f "$HOME/.vnc/self.pem" ]; then
-    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout "$HOME/.vnc/self.pem" -out "$HOME/.vnc/self.pem" \
-        -subj '/C=US/ST=VA/L=None/O=None/OU=zt/CN=kasmvnc' >/dev/null 2>&1
-    chmod 600 "$HOME/.vnc/self.pem"
-fi
-
 rm -f "$HOME/.kasmpasswd"
 if [ "$auth" = 1 ]; then
     if [ -z "${VNC_PW:-}" ]; then

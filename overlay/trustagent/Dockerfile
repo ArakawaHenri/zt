@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 # Qianxin TrustAgent client on zt-base (official ubuntu:24.04 + official KasmVNC).
 #
-# Built offline from the SHA256-verified official Ubuntu Ports libssl1.1 .deb
-# (ports.ubuntu.com) and TrustAgent .deb — zero third-party git repositories.
+# Built from SHA256-verified official Ubuntu compat libs (libssl1.1 / libevent)
+# and the SHA256-pinned TrustAgent .deb mirror (Qianxin has no anonymous public CDN).
 ARG BASE_IMAGE
 
 FROM ubuntu:24.04 AS vendor
@@ -75,5 +75,6 @@ RUN app=/opt/apps/com.qianxin.trustagent \
 
 ENV BYPASS_ROUTES=""
 
-USER 1000
+# PID 1 (zt-init -> systemd) starts as root; desktop and SOCKS units run unprivileged.
+USER root
 ENTRYPOINT ["/usr/local/bin/zt-init"]

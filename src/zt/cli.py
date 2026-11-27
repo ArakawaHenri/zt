@@ -9,6 +9,7 @@ import sys
 
 from zt import VERSION
 from zt.bridge import (
+    bridge_matches,
     bridge_record,
     bridge_start,
     bridge_stop,
@@ -38,6 +39,7 @@ from zt.spec import (
     ACCEPT_MODES,
     AUTH_USER,
     BASE,
+    CAPABILITIES,
     CLIENTS,
     ENGINE_NAMES,
     all_blob_shas,
@@ -64,12 +66,24 @@ def _prune_stale_for(engine, profile, arch):
 
 
 def ensure_image(engine, profile, mode, arch):
+    """Build into a staging tag, verify live, and promote to `ref` only if all checks pass.
+
+    Using a separate `-unverified` staging tag guarantees crash/SIGKILL/retry
+    fail-closed semantics: a failed or interrupted verification can never leave
+    the canonical `ref` behind to bypass verification on the next `zt up`.
+    """
     ref = current_ref(profile, arch)
     if engine.image_exists(ref):
         return ref
-    build(engine, profile, force=True, arch=arch)
-    if verify(engine, profile, mode=mode, arch=arch):
-        die(f'the {profile} image did not pass verification')
+    staging = f'{ref}-unverified'
+    engine.run_cli('image', 'rm', staging, quiet=True, check=False)
+    build(engine, profile, force=True, arch=arch, tag=staging)
+    try:
+        if verify(engine, profile, mode=mode, arch=arch, ref=staging):
+            die(f'the {profile} image did not pass verification')
+        engine.run_cli('image', 'tag', staging, ref, quiet=True)
+    finally:
+        engine.run_cli('image', 'rm', staging, quiet=True, check=False)
     return ref
 
 
@@ -91,6 +105,7 @@ def ensure_container(engine, profile, env, mode, arch=None):
     # the host bridge guards 0.0.0.0:<desktop_port> by source IP.
     publish_host = '127.0.0.1' if mode in ('local', 'lan') else '0.0.0.0'
     publish_port = desktop_backend_port(profile) if mode == 'lan' else desktop_port(profile)
+    # `zt.*` labels track container reconcile state (distinct from `org.zt.*` image/volume ownership).
     wanted = {
         'zt.profile': profile,
         'zt.image': ref,
@@ -191,12 +206,17 @@ def cmd_up(args):
     net_mode = engine.net_mode_for(mode)
     profiles = resolve_targets(args.target)
     envs = {profile: container_env(profile, net_mode=net_mode, mode=mode) for profile in profiles}
-    engine.container_flags()
+    caps = engine.resolved_caps()
     if engine.is_rootless_podman:
         warn(
             'rootless Podman cannot confine capabilities; its containers run --privileged '
             '(confined by the user namespace), CAPS is not enforced, and IPv4 peer filtering '
             'uses subnet mode for gvproxy'
+        )
+    elif engine.is_linux_rootful and caps == 'all':
+        warn(
+            'CAPS=all grants full capabilities on a shared Linux kernel; '
+            'unset CAPS (default: least) or use rootless Docker/Podman for stronger isolation'
         )
     for profile in profiles:
         ensure_image(engine, profile, mode, arch)
@@ -315,10 +335,10 @@ def cmd_status(args=None, engine=None):
         )
         desktop = desktop_url(profile, bind_host=bind_host) if state == 'running' else '-'
         port = socks_port(profile)
-        live_pid, live_engine, live_accept, live_hash = bridge_record(profile)
+        live_pid, live_engine, live_accept, live_hash, live_proto = bridge_record(profile)
         ours = bool(live_pid and live_engine == engine.cli)
         if ours:
-            if live_accept != mode or (mode == 'all' and live_hash != wanted_hash):
+            if not bridge_matches(live_accept, live_hash, live_proto, mode, wanted_hash):
                 socks = 'stale (run zt up)'
             elif socks_ready(port, auth=auth):
                 socks = f'{bind_host}:{port}'
@@ -385,6 +405,31 @@ def cmd_doctor(args):
     if not (present and running):
         sys.exit(0 if all(findings) else 1)
 
+    if getattr(engine, 'is_rootless_podman', False):
+        check('capabilities', True, 'privileged (confined by rootless Podman user namespace)')
+    else:
+        raw_caps = setting('CAPS') or getattr(engine, 'default_caps', 'all')
+        if raw_caps not in CAPABILITIES:
+            check(
+                'capabilities',
+                False,
+                f'CAPS is {raw_caps!r}; must be one of: {", ".join(CAPABILITIES)}',
+            )
+        else:
+            if getattr(engine, 'is_linux_rootful', False):
+                cap_detail = (
+                    f'{raw_caps} (shared Linux kernel; rootless Docker/Podman adds userns isolation)'
+                )
+            elif engine.cli == 'docker':
+                cap_detail = (
+                    f'{raw_caps} (--cap-drop ALL + minimal allowlist)'
+                    if raw_caps == 'least'
+                    else raw_caps
+                )
+            else:
+                cap_detail = f'{raw_caps} (microVM isolated)'
+            check('capabilities', True, cap_detail)
+
     for name in ('base', *CLIENTS):
         ref = current_ref(name, arch)
         built = engine.image_exists(ref)
@@ -421,10 +466,10 @@ def cmd_doctor(args):
                     check(f'port {bport}', False, engine.port_holders(bport) or 'taken')
 
         port = socks_port(profile)
-        live_pid, live_engine, live_accept, live_hash = bridge_record(profile)
+        live_pid, live_engine, live_accept, live_hash, live_proto = bridge_record(profile)
         if live_pid and live_engine == engine.cli:
-            if live_accept != mode or (mode == 'all' and live_hash != wanted_hash):
-                check(f'socks {profile}', False, 'bridge settings changed; run "zt up"')
+            if not bridge_matches(live_accept, live_hash, live_proto, mode, wanted_hash):
+                check(f'socks {profile}', False, 'bridge settings or protocol changed; run "zt up"')
             else:
                 ready = socks_ready(port, auth=auth)
                 check(

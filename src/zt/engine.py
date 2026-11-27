@@ -12,11 +12,13 @@ import subprocess
 import sys
 import threading
 import time
+from typing import NamedTuple
 
 from zt.config import die, resolve_engine_choice, setting, target_arch, warn
 from zt.spec import (
     CAPABILITIES,
     CLIENTS,
+    DOCKER_LEAST_CAPS,
     ENGINE_NAMES,
     STATE_MOUNT,
     container_name,
@@ -26,9 +28,9 @@ from zt.spec import (
 ENGINE_TRIES = 5
 ENGINE_REFUSED = 'Connection refused'
 
-# Matches both legacy (<ver>-<12hex>) and multi-arch (<ver>-<arch>-<12hex>) managed tags.
+# Matches legacy (<ver>-<12hex>), multi-arch (<ver>-<arch>-<12hex>), and staging (-unverified) tags.
 _MANAGED_TAG_RE = re.compile(
-    r'^localhost/zt-(base|' + '|'.join(CLIENTS) + r'):.+-[0-9a-f]{12}$'
+    r'^localhost/zt-(base|' + '|'.join(CLIENTS) + r'):.+-[0-9a-f]{12}(-unverified)?$'
 )
 
 
@@ -67,7 +69,12 @@ def json_lines(text):
 
 
 def passed_through(cli_bin, args, timeout=None, env=None):
-    """Run engine CLI streaming stderr live while retaining tail (POSIX + Windows safe)."""
+    """Run engine CLI streaming stderr live while retaining its tail (POSIX + Windows safe).
+
+    stdout is intentionally inherited directly to the user's terminal rather than
+    captured, so the returned `CompletedProcess.stdout` is always `''`. Callers
+    that need stdout must use `Engine.run_cli(..., quiet=True)`.
+    """
     process = subprocess.Popen([cli_bin, *args], stderr=subprocess.PIPE, env=env)
     kept = []
     kept_bytes = 0
@@ -233,9 +240,14 @@ class Engine:
     display_name = ''
     start_hint = ''
     pass_hostname = False
+    default_caps = 'all'
 
     @property
     def is_rootless_podman(self):
+        return False
+
+    @property
+    def is_linux_rootful(self):
         return False
 
     @property
@@ -292,10 +304,14 @@ class Engine:
         if not self.is_running():
             die(f'{self.display_name} is not running; {self.start_hint}')
 
-    def _cap_flags(self, caps_override=None):
-        caps = (setting('CAPS') if caps_override is None else caps_override) or 'all'
+    def resolved_caps(self, caps_override=None):
+        caps = (setting('CAPS') if caps_override is None else caps_override) or self.default_caps
         if caps not in CAPABILITIES:
             die(f'CAPS is {caps!r}; it must be one of: {", ".join(CAPABILITIES)}')
+        return caps
+
+    def _cap_flags(self, caps_override=None):
+        caps = self.resolved_caps(caps_override)
         return [arg for cap in CAPABILITIES[caps] for arg in ('--cap-add', cap)]
 
     def container_flags(self, caps_override=None):
@@ -454,17 +470,27 @@ class AppleContainerEngine(Engine):
         return sorted(found)
 
 
+class DaemonTraits(NamedTuple):
+    is_podman: bool = False
+    is_rootless: bool = False
+    has_selinux: bool = False
+    is_desktop_vm: bool = False
+
+
 class DockerEngine(Engine):
     cli = 'docker'
     display_name = ENGINE_NAMES['docker']
     start_hint = 'start the daemon (Docker Desktop, or `podman machine start`)'
     pass_hostname = True
+    default_caps = 'least'
 
     @functools.cached_property
     def _daemon_traits(self):
-        """Query engine once to detect Podman and rootless mode accurately."""
+        """Query engine once to detect Podman, rootless mode, SELinux, and VM desktop daemons."""
         is_podman = False
         is_rootless = False
+        has_selinux = False
+        is_desktop_vm = False
         info_proc = self.run_cli('info', '--format', '{{json .}}', quiet=True, check=False)
         try:
             info = json.loads(info_proc.stdout) if info_proc.returncode == 0 else {}
@@ -475,32 +501,67 @@ class DockerEngine(Engine):
             sec_opts = info.get('SecurityOptions') or []
             if any('rootless' in str(opt).lower() for opt in sec_opts):
                 is_rootless = True
-            host_sec = (info.get('Host') or {}).get('Security') or {}
+            if any('selinux' in str(opt).lower() for opt in sec_opts):
+                has_selinux = True
+            host_info = info.get('Host') if isinstance(info.get('Host'), dict) else {}
+            host_sec = host_info.get('Security') if isinstance(host_info.get('Security'), dict) else {}
             if host_sec.get('Rootless'):
                 is_rootless = True
-            if 'podman' in json.dumps(info).lower():
+            if host_sec.get('SELinuxEnabled'):
+                has_selinux = True
+            if 'docker desktop' in str(info.get('OperatingSystem', '')).lower():
+                is_desktop_vm = True
+            if (
+                any(k in host_info for k in ('BuildahVersion', 'Conmon', 'Slirp4netns'))
+                or 'podman' in str(info.get('ServerVersion', '')).lower()
+                or 'podman' in str((info.get('Platform') or {}).get('Name', '')).lower()
+            ):
                 is_podman = True
 
         if not is_podman:
             ver_proc = self.run_cli('version', '--format', '{{json .Server}}', quiet=True, check=False)
             try:
-                components = json.loads(ver_proc.stdout).get('Components') or []
-                is_podman = any('Podman' in str(c.get('Name', '')) for c in components)
+                server = json.loads(ver_proc.stdout) if ver_proc.returncode == 0 else {}
+                if isinstance(server, dict):
+                    components = server.get('Components') or []
+                    is_podman = any('podman' in str(c.get('Name', '')).lower() for c in components)
+                    if not is_podman:
+                        is_podman = 'podman' in str((server.get('Platform') or {}).get('Name', '')).lower()
             except (ValueError, AttributeError):
                 pass
             if is_podman and not info:
                 is_rootless = True
 
-        return is_podman, is_rootless
+        return DaemonTraits(
+            is_podman=is_podman,
+            is_rootless=is_rootless,
+            has_selinux=has_selinux,
+            is_desktop_vm=is_desktop_vm,
+        )
 
     @property
     def is_podman(self):
-        return self._daemon_traits[0]
+        return self._daemon_traits.is_podman
+
+    @property
+    def is_rootless(self):
+        return self._daemon_traits.is_rootless
+
+    @property
+    def has_selinux(self):
+        return self._daemon_traits.has_selinux
+
+    @property
+    def is_desktop_vm(self):
+        return self._daemon_traits.is_desktop_vm
 
     @property
     def is_rootless_podman(self):
-        is_podman, is_rootless = self._daemon_traits
-        return is_podman and is_rootless
+        return self.is_podman and self.is_rootless
+
+    @property
+    def is_linux_rootful(self):
+        return sys.platform.startswith('linux') and not self.is_rootless and not self.is_desktop_vm
 
     def net_mode_for(self, accept='local'):
         # Rootless Podman uses gvproxy routed forwarding; Docker in `accept all`
@@ -513,20 +574,33 @@ class DockerEngine(Engine):
             == 0
         )
 
+    def _cap_flags(self, caps_override=None):
+        caps = self.resolved_caps(caps_override)
+        if caps == 'least':
+            return [
+                '--cap-drop', 'ALL',
+                *(arg for cap in DOCKER_LEAST_CAPS for arg in ('--cap-add', cap)),
+            ]
+        return [arg for cap in CAPABILITIES[caps] for arg in ('--cap-add', cap)]
+
     def container_flags(self, caps_override=None):
         adds = self._cap_flags(caps_override)
         base = [
             '--cpus', '2', '--memory', '2g',
+            '--pids-limit', '1024',
             '--shm-size', '512m', '--user', 'root',
-            '--security-opt', 'label=disable',
-            '--tmpfs', '/run', '--tmpfs', '/run/lock',
+            '--tmpfs', '/run:rw,nosuid,nodev,size=64m',
+            '--tmpfs', '/run/lock:rw,noexec,nosuid,nodev,size=16m',
             '--cgroupns=private',
         ]
+        if self.is_rootless_podman or self.has_selinux:
+            # systemd requires label=disable when SELinux or rootless Podman confinement is active.
+            base += ['--security-opt', 'label=disable']
         if self.is_rootless_podman:
-            # Rootless Podman cannot pass --device /dev/net/tun or confine CAPS=all;
+            # Rootless Podman cannot pass --device /dev/net/tun or confine CAPS;
             # boot --privileged inside the user namespace without contradictory --cap-add.
             return tuple([*base, '--privileged'])
-        return tuple([*base, *adds, '--device', '/dev/net/tun'])
+        return tuple([*base, *adds, '--device', '/dev/net/tun:/dev/net/tun:rw'])
 
     def ensure_volume(self, name, profile):
         if self.volume_exists(name):

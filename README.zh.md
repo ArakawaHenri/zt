@@ -8,7 +8,7 @@
 
 **zt** 将三款国内企业零信任 VPN 客户端——**奇安信 TrustAgent**、**深信服 aTrust**、**深信服 EasyConnect**——封装在隔离的 Linux 容器中，支持 **macOS**、**Linux** 与 **Windows**（`arm64` / `amd64` 双架构）。
 
-每个客户端提供一个基于 KasmVNC 的浏览器桌面和一条直通 VPN 隧道的多路复用 SOCKS5 代理端口，彻底隔离厂商后台常驻服务、全局路由劫持、DNS 篡改与系统根证书污染。
+每个客户端提供一个基于 KasmVNC 的浏览器桌面和一条直通 VPN 隧道的多路复用 SOCKS5 代理端口（支持 TCP `CONNECT` 与单播 UDP `UDP ASSOCIATE`），彻底隔离厂商后台常驻服务、全局路由劫持、DNS 篡改与系统根证书污染。
 
 - **零依赖单文件分发**：除 Python 3 解释器外零第三方依赖、无需 `git`，单文件 `zipapp`（macOS / Linux 为 `zt`，Windows 为 `zt.pyz`）。
 - **极简 7 命令封装**：仅暴露 `up`、`down`、`status`、`doctor`、`purge`、`accept`、`password`。
@@ -129,7 +129,7 @@ ALL_PROXY=socks5h://kasm_user:<password>@<host>:16912 curl https://internal.corp
 - `ACCEPT`：`local`（默认）、`lan` 或 `all`。
 - `VNC_PW`：6–8 位密码，由 `zt password` 写入（`ACCEPT=all` 时生效）。
 - `TRUSTAGENT_BYPASS_ROUTES`：可选，逗号分隔的 CIDR 列表，配置后 TrustAgent 策略路由表（`100 bypass`）会将对应网段走容器默认网关而非 VPN 隧道。
-- `CAPS`：容器能力配置——`all`（默认）或 `least`（仅 `NET_ADMIN` + `SYS_ADMIN`）。
+- `CAPS`：容器能力配置——Docker 引擎默认 `least`（先 `--cap-drop ALL` 再按最小白名单加权，配合 `/dev/net/tun` 只给 `:rw` 与 `--pids-limit 1024`），Apple Container 独立微虚拟机默认 `all`；可手动指定 `least` 或 `all`。
 - `ZT_ENGINE`：临时指定容器引擎（`container` 或 `docker`）。
 - `ZT_ARCH`：临时指定目标镜像架构（`arm64` 或 `amd64`）。
 
@@ -155,11 +155,13 @@ ALL_PROXY=socks5h://kasm_user:<password>@<host>:16912 curl https://internal.corp
 - **权限隔离（`privilege`、`setuid`、`ownership`、`programs`）**：基础镜像不装 `sudo`；所有 GUI 均以 `kasm-user` 零能力（`CapEff=0`）且 `NoNewPrivs=1` 运行；全部 systemd unit 强制 `NoNewPrivileges=true`；审计所有 root 执行路径与符号链接链；校验 `kasm-user` 在声明目录外不拥有任何系统文件。
 - **运行时完整性（`units`、`ui`、`libraries`、`timezone`、`log`）**：校验服务活跃、X11 实际渲染出业务窗口、原生 ELF `e_machine` 与 `ldd` 依赖无缺失、宿主机时区同步以及无致命报错日志。
 
-### 信任边界说明
+### 信任边界与架构限制
 
 - **`accept local`**：仅监听 `127.0.0.1` 免密访问；在浏览器信任自签 HTTPS 证书后，建议避免在同一浏览器配置中打开不可信网页。
 - **`accept lan`**：同一私网 / 局域网 / Tailscale 网段内设备可免密访问桌面与 SOCKS5，仅适用于可信家庭/办公局域网或加密私网，请勿在公共 Wi-Fi 下开启。
 - **`accept all`**：SOCKS5 RFC 1929 提供账号密码认证，但 SOCKS5 协议本身不带 TLS 加密；跨不可信网络建议配合 Tailscale / WireGuard 等加密隧道使用。
+- **Linux rootful Docker 隔离边界**：在原生 Linux 下使用 rootful Docker 时容器共享宿主机内核（命名空间边界，而非 macOS / Windows 下的虚拟机边界）。`zt` 对 Docker 默认启用 `CAPS=least`（`--cap-drop ALL` + 最小能力白名单，剥离 `SYS_MODULE`、`SYS_RAWIO`、`SYS_PTRACE`、`BPF`、`DAC_READ_SEARCH`、`MKNOD` 等高危能力）、`/dev/net/tun` 仅赋予 `:rw`、`--pids-limit 1024`、收紧 `/run` tmpfs，且仅在检测到 SELinux 时才设置 `label=disable`。在 Linux 上如需额外的用户命名空间隔离层，优先推荐使用 rootless Docker 或 rootless Podman。
+- **SOCKS5 UDP 与吞吐边界**：SOCKS5 支持 TCP `CONNECT` 与单播 `UDP ASSOCIATE`（适配 Clash / sing-box / Surge TUN 分流、QUIC、内网 DNS、UDP RPC 等），严格绑定源 IP 与 TCP 控制连接生命周期，TCP 采用单流信用窗口流控（`WINDOW_UPDATE`）确保单条停读连接绝不阻塞其他流或新握手，UDP 采用有界 drop-on-full 队列确保突发流量不拖慢 TCP。组播/广播发现与外部主动入站 P2P UDP 不经过 SOCKS5 与容器防火墙，这类应用请直接使用 KasmVNC 浏览器桌面。所有代理流量复用单条 stdio 管道，适合交互式办公 / SSH / Git / 网页场景，并非面向高吞吐大文件传输设计。
 
 ## 开发与测试
 

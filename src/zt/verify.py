@@ -179,8 +179,8 @@ def host_only_holds(engine, name, net_mode=None, arch=None):
         except ValueError:
             ipv6, peer_v6_cidr = '', ''
 
-    questions = ['desktop over IPv4', 'stand-in over IPv4'] + (
-        ['stand-in over IPv6'] if ipv6 else []
+    questions = ['desktop over IPv4', 'stand-in over IPv4', 'stand-in UDP over IPv4'] + (
+        ['stand-in over IPv6', 'stand-in UDP over IPv6'] if ipv6 else []
     )
     other = f'{name}-from'
     probe_src = guest_script('probe').encode('utf-8')
@@ -274,19 +274,20 @@ def logs_tail(engine, name, lines=12):
     return (text or '').strip().splitlines()[-lines:]
 
 
-def verify(engine, profile, mode=None, arch=None, keep=False):
+def verify(engine, profile, mode=None, arch=None, keep=False, ref=None):
     """Boot the client's image once on loopback and run every guest + peer check."""
     arch = arch or target_arch()
     mode = mode or accept_mode()
     net_mode = engine.net_mode_for(mode)
     name = f'zt-verify-{profile}'
-    ref = current_ref(profile, arch)
+    ref = ref or current_ref(profile, arch)
     if not engine.image_exists(ref):
         die(f'{ref} is not built; run "zt up {profile}"')
     env = container_env(profile, net_mode=net_mode, mode=mode)
     port = free_port()
     say(f'{profile}: booting {ref} ({platform_for(arch)}) to check it')
     engine.run_cli('rm', '-f', name, quiet=True, check=False)
+    # `zt.*` labels mark runtime/ephemeral container state; `org.zt.*` marks image/volume ownership.
     engine.run_container(
         name, ref, env, port, {'zt.verify': profile},
         bind_host='127.0.0.1', arch=arch, quiet=True,

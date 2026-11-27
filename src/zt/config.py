@@ -244,21 +244,23 @@ def write_setting(key, value):
     kept = [line for line in lines if line.split('=', 1)[0].strip() != key]
     payload = ''.join(f'{line}\n' for line in kept) + f'{key}={value}\n'
     path.parent.mkdir(parents=True, exist_ok=True)
-    if os.name == 'nt':
-        fd, tmp_name = tempfile.mkstemp(prefix='.config-', dir=path.parent)
-        tmp = Path(tmp_name)
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
-                handle.write(payload)
-            os.replace(tmp, path)
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
-    else:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+    fd, tmp_name = tempfile.mkstemp(prefix='.config-', dir=path.parent)
+    tmp = Path(tmp_name)
+    fd_owned = True
+    try:
+        if os.name != 'nt':
+            os.fchmod(fd, 0o600)
+        fd_owned = False
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
             handle.write(payload)
-        path.chmod(0o600)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if fd_owned:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -290,8 +292,11 @@ def password_valid(password):
     return (
         6 <= len(password) <= 8
         and password.strip() == password
+        and '\n' not in password
+        and '\r' not in password
         and bool(password)
         and password[0] not in '#"\''
+        and parse_config(f'VNC_PW={password}\n').get('VNC_PW') == password
     )
 
 

@@ -1,7 +1,7 @@
 network:
   ssl:
-    pem_certificate: ${HOME}/.vnc/self.pem
-    pem_key: ${HOME}/.vnc/self.pem
+    pem_certificate: /etc/ssl/certs/ssl-cert-snakeoil.pem
+    pem_key: /etc/ssl/private/ssl-cert-snakeoil.key
   udp:
     public_ip: 127.0.0.1
 runtime_configuration:

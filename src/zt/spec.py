@@ -115,6 +115,7 @@ BASE = {
 
 CLIENTS = {
     'trustagent': {
+        'port': 16901,
         'version': _TRUSTAGENT,
         'overlays': ('common', 'trustagent'),
         'dockerfile': 'Dockerfile',
@@ -149,6 +150,7 @@ CLIENTS = {
         'setuid': (),
     },
     'atrust': {
+        'port': 16911,
         'version': _ATRUST,
         'overlays': ('common', 'sangfor/common', 'sangfor/atrust'),
         'dockerfile': 'Dockerfile',
@@ -172,6 +174,7 @@ CLIENTS = {
         'setuid': (),
     },
     'easyconnect': {
+        'port': 16921,
         'version': '7.6.7',
         'overlays': ('common', 'sangfor/common', 'sangfor/easyconnect'),
         'dockerfile': 'Dockerfile',
@@ -230,6 +233,7 @@ EXECUTABLE_OVERLAYS = frozenset((
     'base/rootfs/usr/local/bin/zt-kasmvnc.sh',
     'common/rootfs/usr/local/bin/zt-init',
     'common/rootfs/usr/local/bin/zt-net-setup.sh',
+    'sangfor/common/install-deb.sh',
     'sangfor/common/rootfs/usr/bin/xdg-open',
     'sangfor/atrust/rootfs/usr/bin/loginctl',
     'sangfor/atrust/rootfs/usr/sbin/sysctl-hook',
@@ -270,6 +274,28 @@ CAPABILITIES = {
     'all': ('ALL',),
     'least': ('NET_ADMIN', 'SYS_ADMIN'),
 }
+
+# Explicit minimal capability allowlist for Docker when CAPS=least (default on
+# Docker), applied after --cap-drop ALL. Excludes dangerous host-kernel
+# capabilities (SYS_MODULE, SYS_RAWIO, SYS_PTRACE, SYS_BOOT, SYS_TIME,
+# DAC_READ_SEARCH, BPF, PERFMON, MAC_*, SYSLOG) as well as MKNOD (/dev/net/tun
+# is mounted read-write via --device) and SETFCAP.
+DOCKER_LEAST_CAPS = (
+    'AUDIT_WRITE',
+    'CHOWN',
+    'DAC_OVERRIDE',
+    'FOWNER',
+    'FSETID',
+    'KILL',
+    'NET_ADMIN',
+    'NET_BIND_SERVICE',
+    'NET_RAW',
+    'SETGID',
+    'SETPCAP',
+    'SETUID',
+    'SYS_ADMIN',
+    'SYS_CHROOT',
+)
 
 CHECKS = (
     'units',
@@ -338,7 +364,7 @@ def spec_args_for(spec, arch=None):
 
 
 def desktop_port(profile):
-    return 16901 + 10 * list(CLIENTS).index(profile)
+    return CLIENTS[profile]['port']
 
 
 def socks_port(profile):

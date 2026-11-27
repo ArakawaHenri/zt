@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """In-container network reachability probe and ZT-INPUT control toggle.
 
-Used during `zt verify` from a second peer container (`probe`, `setup-ipv6`) and
-inside the target container (`toggle out|in <net_mode>`).
+Used during image verification from a second peer container (`probe`, `setup-ipv6`)
+and inside the target container (`toggle out|in <net_mode>`).
 """
 import concurrent.futures
 import errno
@@ -45,15 +45,28 @@ def probe_tcp(address, port, timeout=4.0):
         return 'refused' if error.errno == errno.ECONNREFUSED else 'stopped'
 
 
+def probe_udp(address, port, timeout=2.0):
+    family = socket.AF_INET6 if ':' in address else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.sendto(b'zt', (address, port))
+            return 'through' if sock.recvfrom(64)[0] == b'pong:zt' else 'stopped'
+    except OSError:
+        return 'stopped'
+
+
 def cmd_probe(ipv4, ipv6, port):
     questions = [
-        ('desktop over IPv4', ipv4, 6901),
-        ('stand-in over IPv4', ipv4, port),
+        ('desktop over IPv4', probe_tcp, ipv4, 6901),
+        ('stand-in over IPv4', probe_tcp, ipv4, port),
+        ('stand-in UDP over IPv4', probe_udp, ipv4, port),
     ]
     if ipv6:
-        questions.append(('stand-in over IPv6', ipv6, port))
+        questions.append(('stand-in over IPv6', probe_tcp, ipv6, port))
+        questions.append(('stand-in UDP over IPv6', probe_udp, ipv6, port))
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(questions)) as pool:
-        futs = [(label, pool.submit(probe_tcp, addr, to)) for label, addr, to in questions]
+        futs = [(label, pool.submit(fn, addr, to)) for label, fn, addr, to in questions]
         answers = {label: fut.result() for label, fut in futs}
     print(json.dumps(answers, sort_keys=True))
 
@@ -75,20 +88,24 @@ def cmd_toggle(direction, net_mode):
         print('no default route', file=sys.stderr)
         sys.exit(1)
 
-    v4_cmd = ['iptables', '-t', 'filter', '-D', 'ZT-INPUT', '-i', wan]
-    if net_mode == 'subnet':
-        subnet = link_subnet(wan)
-        if not subnet:
-            print(f'no link-scope subnet on {wan}', file=sys.stderr)
-            sys.exit(1)
-        v4_cmd += ['-s', subnet]
-    v4_cmd += ['-p', 'tcp', '-m', 'comment', '--comment', 'zt: host only', '-j', 'DROP']
+    subnet = link_subnet(wan) if net_mode == 'subnet' else ''
+    if net_mode == 'subnet' and not subnet:
+        print(f'no link-scope subnet on {wan}', file=sys.stderr)
+        sys.exit(1)
 
-    v6_cmd = [
-        'ip6tables', '-t', 'filter', '-D', 'ZT-INPUT', '-i', wan,
-        '-p', 'tcp', '-m', 'comment', '--comment', 'zt: host only', '-j', 'DROP',
-    ]
-    for cmd in (v4_cmd, v6_cmd):
+    cmds = []
+    for proto, comment in (('tcp', 'zt: host only'), ('udp', 'zt: host only udp')):
+        v4_cmd = ['iptables', '-t', 'filter', '-D', 'ZT-INPUT', '-i', wan]
+        if net_mode == 'subnet':
+            v4_cmd += ['-s', subnet]
+        v4_cmd += ['-p', proto, '-m', 'comment', '--comment', comment, '-j', 'DROP']
+        v6_cmd = [
+            'ip6tables', '-t', 'filter', '-D', 'ZT-INPUT', '-i', wan,
+            '-p', proto, '-m', 'comment', '--comment', comment, '-j', 'DROP',
+        ]
+        cmds.extend((v4_cmd, v6_cmd))
+
+    for cmd in cmds:
         proc = subprocess.run(cmd, check=False)
         if proc.returncode != 0:
             sys.exit(proc.returncode)

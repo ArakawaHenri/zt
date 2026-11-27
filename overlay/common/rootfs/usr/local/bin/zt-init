@@ -26,17 +26,22 @@ if [ -d "$STATE_ROOT" ] && mountpoint -q "$STATE_ROOT"; then
     cp "$STATE_ROOT/machine-id" /etc/machine-id
     chmod 0444 /etc/machine-id
 
-    # Keep the self-signed KasmVNC TLS cert stable across base-image rebuilds.
+    # Keep a unique, persistent self-signed KasmVNC TLS cert per state volume
+    # so browser trust survives container recreates & base-image rebuilds.
     CERT=/etc/ssl/certs/ssl-cert-snakeoil.pem
     KEY=/etc/ssl/private/ssl-cert-snakeoil.key
-    if [ -f "$STATE_ROOT/tls/cert.pem" ] && [ -f "$STATE_ROOT/tls/key.pem" ]; then
-        install -o root -g root -m 0644 "$STATE_ROOT/tls/cert.pem" "$CERT"
-        install -o root -g ssl-cert -m 0640 "$STATE_ROOT/tls/key.pem" "$KEY"
-    elif [ -f "$CERT" ] && [ -f "$KEY" ]; then
+    if [ ! -s "$STATE_ROOT/tls/cert.pem" ] || [ ! -s "$STATE_ROOT/tls/key.pem" ]; then
         install -d -o root -g root -m 0700 "$STATE_ROOT/tls"
-        install -o root -g root -m 0644 "$CERT" "$STATE_ROOT/tls/cert.pem"
-        install -o root -g ssl-cert -m 0640 "$KEY" "$STATE_ROOT/tls/key.pem"
+        cn=$(hostname 2>/dev/null || echo kasmvnc)
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+            -keyout "$STATE_ROOT/tls/key.pem" -out "$STATE_ROOT/tls/cert.pem" \
+            -subj "/C=US/ST=VA/L=None/O=None/OU=zt/CN=$cn" >/dev/null 2>&1
+        chown root:root "$STATE_ROOT/tls/cert.pem" "$STATE_ROOT/tls/key.pem"
+        chmod 0644 "$STATE_ROOT/tls/cert.pem"
+        chmod 0600 "$STATE_ROOT/tls/key.pem"
     fi
+    install -o root -g root -m 0644 "$STATE_ROOT/tls/cert.pem" "$CERT"
+    install -o root -g ssl-cert -m 0640 "$STATE_ROOT/tls/key.pem" "$KEY"
 
     # Bind-mount each declared client state directory from the persistent volume.
     if [ -r /etc/zt/state-paths.conf ]; then
