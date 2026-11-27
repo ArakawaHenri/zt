@@ -12,7 +12,7 @@
 
 - **零依赖单文件分发**：除 Python 3 解释器外零第三方依赖、无需 `git`，单文件 `zipapp`（macOS / Linux 为 `zt`，Windows 为 `zt.pyz`）。
 - **极简 7 命令封装**：仅暴露 `up`、`down`、`status`、`doctor`、`purge`、`accept`、`password`。
-- **默认本机免密**：默认仅监听 `127.0.0.1` 且无需密码，开箱即用；按需切换 `zt accept lan`（宿主机源 IP 过滤的免密局域网模式）或 `zt accept all`（`0.0.0.0` 全网监听，桌面与 SOCKS5 共用同一套密码认证）。
+- **默认本机免密**：默认仅监听 `127.0.0.1` 且无需密码，开箱即用；按需切换 `zt accept lan`（宿主机源 IP 过滤的局域网模式）或 `zt accept all`（`0.0.0.0` 全网监听，必填密码），并可随时通过 `zt password [--clear]` 设密或清密。
 - **重建容器不丢登录态**：VPN 登录凭据、Cookie、设备指纹（`/etc/machine-id`）与自签桌面 TLS 证书保存在独立数据卷（`zt-state-<client>`），执行 `zt down`、升级镜像、切换 `zt accept` 或修改密码重建容器时自动保留。
 - **先验后用**：每个新构建镜像首次启动前自动执行 13 项实机安全与运行不变量校验（iptables 隔离正反对照实验、最小权限与 `NoNewPrivileges`、ELF 架构与动态库完整性、X11 窗口渲染等）。
 
@@ -80,7 +80,7 @@ zt status [all | client]    查看访问模式、目标架构、容器状态、�
 zt doctor                   全面体检容器引擎、架构、配置、镜像、端口、桌面与桥接状态
 zt purge [all | client]     停止并删除容器、登录态数据卷、已构建镜像与宿主机缓存
 zt accept [local|lan|all]   设置允许访问范围（默认 local）；无参数时显示当前模式
-zt password                 设置或修改密码（accept all 模式下必需）
+zt password [--clear]       设置、修改或清除密码（accept all 模式下必填）
 ```
 
 ## 访问范围与认证（`zt accept`）
@@ -89,18 +89,18 @@ zt password                 设置或修改密码（accept all 模式下必需�
 
 | 模式 | 监听地址 | 密码 | 说明 |
 |---|---|---|---|
-| `local` *（默认）* | `127.0.0.1` | 免密 | 仅本机访问，打开浏览器桌面和使用 SOCKS5 均零阻力。 |
-| `lan` | `0.0.0.0` | 免密 | 容器桌面仍只绑定本机回环（`127.0.0.1:169x6`），由宿主机桥接统一对外监听 `0.0.0.0:169x1` 和 `0.0.0.0:169x2` 并按源 IP 过滤，仅放行私网/局域网/Tailscale 网段（`127/8`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、`::1`、`fc00::/7`、`fe80::/10`）。切换 Wi-Fi / DHCP 无需重建容器。 |
+| `local` *（默认）* | `127.0.0.1` | 可选 | 仅本机访问，未设密码时开箱免密。 |
+| `lan` | `0.0.0.0` | 可选 | 容器桌面仍只绑定本机回环（`127.0.0.1:169x6`），由宿主机桥接统一对外监听 `0.0.0.0:169x1` 和 `0.0.0.0:169x2` 并按源 IP 过滤，仅放行私网/局域网/Tailscale 网段（`127/8`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、`::1`、`fc00::/7`、`fe80::/10`）。切换 Wi-Fi / DHCP 无需重建容器。 |
 | `all` | `0.0.0.0` | 必填（6–8 位） | Web 桌面启用 HTTPS Basic Auth、SOCKS5 启用 RFC 1929 用户名密码认证，统一使用 `kasm_user` 与 `zt password` 设置的密码。 |
 
 ```sh
 # 仅本机（默认）
 ALL_PROXY=socks5h://127.0.0.1:16912 curl https://internal.corp.example
 
-# 局域网免密（执行 `zt accept lan && zt up` 后）
+# 局域网（执行 `zt accept lan && zt up` 后）
 ALL_PROXY=socks5h://<局域网宿主机IP>:16912 curl https://internal.corp.example
 
-# 全网密码认证（执行 `zt accept all && zt up` 后）
+# 启用密码认证（执行 `zt password && zt up` 或 `zt accept all && zt up` 后）
 ALL_PROXY=socks5h://kasm_user:<password>@<host>:16912 curl https://internal.corp.example
 ```
 
@@ -127,7 +127,7 @@ ALL_PROXY=socks5h://kasm_user:<password>@<host>:16912 curl https://internal.corp
 可用配置项（均可通过 `ZT_<KEY>` 环境变量单次覆盖）：
 
 - `ACCEPT`：`local`（默认）、`lan` 或 `all`。
-- `VNC_PW`：6–8 位密码，由 `zt password` 写入（`ACCEPT=all` 时生效）。
+- `VNC_PW`：6–8 位密码，通过 `zt password` / `zt password --clear` 管理（只要设置即在所有模式下生效，`ACCEPT=all` 时必填）。
 - `TRUSTAGENT_BYPASS_ROUTES`：可选，逗号分隔的 CIDR 列表，配置后 TrustAgent 策略路由表（`100 bypass`）会将对应网段走容器默认网关而非 VPN 隧道。
 - `CAPS`：容器能力配置——Docker 引擎默认 `least`（先 `--cap-drop ALL` 再按最小白名单加权，配合 `/dev/net/tun` 只给 `:rw` 与 `--pids-limit 1024`），Apple Container 独立微虚拟机默认 `all`；可手动指定 `least` 或 `all`。
 - `ZT_ENGINE`：临时指定容器引擎（`container` 或 `docker`）。
@@ -150,7 +150,7 @@ ALL_PROXY=socks5h://kasm_user:<password>@<host>:16912 curl https://internal.corp
 
 每次构建新镜像后、`zt up` 正式启用前，会先在回环地址上启动校验容器跑完 13 项实机检查：
 
-- **`auth`**：`local`/`lan` 模式下确认直连返回 `HTTP 200`；`all` 模式下确认无密码返回 `401`、带密码返回 `200`。
+- **`auth`**：未设密码时确认直连返回 `HTTP 200`；设置密码时确认无密码返回 `401`、带密码返回 `200`。
 - **网络隔离（`policy`、`tunnel`、`reachability`）**：在 `INPUT` 第 1 条挂载独立 `ZT-INPUT` 链（IPv4 & IPv6），丢弃来自同网段其他容器及 VPN 隧道接口（`tun+`、`utun+`、`vnic+`）的主动 TCP/UDP 入站连接，并通过两轮撤回/恢复对照实测确认。
 - **权限隔离（`privilege`、`setuid`、`ownership`、`programs`）**：基础镜像不装 `sudo`；所有 GUI 均以 `kasm-user` 零能力（`CapEff=0`）且 `NoNewPrivs=1` 运行；全部 systemd unit 强制 `NoNewPrivileges=true`；审计所有 root 执行路径与符号链接链；校验 `kasm-user` 在声明目录外不拥有任何系统文件。
 - **运行时完整性（`units`、`ui`、`libraries`、`timezone`、`log`）**：校验服务活跃、X11 实际渲染出业务窗口、原生 ELF `e_machine` 与 `ldd` 依赖无缺失、宿主机时区同步以及无致命报错日志。

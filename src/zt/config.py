@@ -234,15 +234,9 @@ def setting(key):
     return settings.get(key, '')
 
 
-def write_setting(key, value):
-    """Atomically update KEY=VALUE in config_file() with 0600 permissions on POSIX."""
-    path = config_file()
-    try:
-        lines = path.read_text(encoding='utf-8').splitlines()
-    except OSError:
-        lines = []
-    kept = [line for line in lines if line.split('=', 1)[0].strip() != key]
-    payload = ''.join(f'{line}\n' for line in kept) + f'{key}={value}\n'
+def _write_config_lines(path, lines):
+    """Atomically write `lines` to `path` with 0600 permissions on POSIX."""
+    payload = ''.join(f'{line}\n' for line in lines)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix='.config-', dir=path.parent)
     tmp = Path(tmp_name)
@@ -262,6 +256,31 @@ def write_setting(key, value):
         tmp.unlink(missing_ok=True)
         raise
     return path
+
+
+def write_setting(key, value):
+    """Atomically update KEY=VALUE in config_file() with 0600 permissions on POSIX."""
+    path = config_file()
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        lines = []
+    kept = [line for line in lines if line.split('=', 1)[0].strip() != key]
+    return _write_config_lines(path, [*kept, f'{key}={value}'])
+
+
+def delete_setting(key):
+    """Atomically remove KEY from config_file(); returns (path, removed_bool)."""
+    path = config_file()
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return path, False
+    kept = [line for line in lines if line.split('=', 1)[0].strip() != key]
+    if len(kept) == len(lines):
+        return path, False
+    _write_config_lines(path, kept)
+    return path, True
 
 
 def accept_mode():
@@ -301,25 +320,33 @@ def password_valid(password):
 
 
 def auth_password(mode=None):
-    """Return password when mode == 'all' (failing if missing/invalid), else ''."""
+    """Return active password whenever set (required in `all`, optional in `local`/`lan`).
+
+    Fails closed if `mode == 'all'` has no password, or if a non-empty password
+    in any mode has an invalid format.
+    """
     mode = mode or accept_mode()
-    if mode != 'all':
-        return ''
     password = setting('VNC_PW')
+    if not password:
+        if mode == 'all':
+            die(
+                'accept mode is "all" and requires a 6 to 8 character password; '
+                'run "zt password" first'
+            )
+        return ''
     if not password_valid(password):
         die(
-            'accept mode is "all" and requires a 6 to 8 character password; '
-            'run "zt password" first'
+            'VNC_PW must be 6 to 8 characters without leading/trailing spaces, '
+            'newlines, or leading #, ", \'; run "zt password" to fix it'
         )
     return password
 
 
 def auth_fingerprint(mode=None, password=None):
-    """Short non-reversible digest of active auth state (empty in local/lan mode)."""
-    mode = mode or accept_mode()
-    if mode != 'all':
-        return ''
+    """Short non-reversible digest of active password (empty when no password is set)."""
     pw = auth_password(mode) if password is None else password
+    if not pw:
+        return ''
     return hashlib.sha256(pw.encode('utf-8')).hexdigest()[:12]
 
 
@@ -360,9 +387,10 @@ def host_timezone():
 def container_env(profile, net_mode='gateway', mode=None):
     """Environment of a container of this client."""
     mode = mode or accept_mode()
-    env = {'ZT_NET_MODE': net_mode, 'ZT_AUTH': '1' if mode == 'all' else '0'}
-    if mode == 'all':
-        env['VNC_PW'] = auth_password(mode)
+    password = auth_password(mode)
+    env = {'ZT_NET_MODE': net_mode, 'ZT_AUTH': '1' if password else '0'}
+    if password:
+        env['VNC_PW'] = password
     zone = host_timezone()
     if zone:
         env['TZ'] = zone

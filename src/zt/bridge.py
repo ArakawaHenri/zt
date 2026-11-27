@@ -258,7 +258,7 @@ def bridge_matches(live_accept, live_hash, live_proto, mode, wanted_hash):
     """True when a running bridge matches the desired accept mode, password hash, and protocol."""
     return (
         live_accept == mode
-        and (mode != 'all' or live_hash == wanted_hash)
+        and live_hash == wanted_hash
         and live_proto == BRIDGE_PROTO
     )
 
@@ -290,7 +290,7 @@ def bridge_start(engine, profile, mode=None, wait_seconds=45.0):
     mode = mode or accept_mode()
     password = auth_password(mode)
     wanted_hash = auth_fingerprint(mode, password)
-    auth = (AUTH_USER, password) if mode == 'all' else None
+    auth = (AUTH_USER, password) if password else None
     bind_host = bind_address(mode)
     port = socks_port(profile)
 
@@ -332,7 +332,7 @@ def bridge_start(engine, profile, mode=None, wait_seconds=45.0):
     child_env = dict(base_env if base_env is not None else os.environ)
     child_env['ZT_ENGINE'] = engine.cli
     child_env['ZT_ACCEPT'] = mode
-    if mode == 'all':
+    if password:
         child_env['ZT_VNC_PW'] = password
     else:
         child_env.pop('ZT_VNC_PW', None)
@@ -1032,7 +1032,9 @@ async def serve(engine, name, port, bind_host='127.0.0.1', auth=None,
                 await srv.wait_closed()
             raise
 
-    mode_label = 'auth required' if auth else ('LAN only, no password' if lan_only else 'local, no password')
+    scope_label = 'LAN only' if lan_only else ('local' if bind_host == '127.0.0.1' else 'all')
+    auth_label = 'password required' if auth else 'no password'
+    mode_label = f'{scope_label}, {auth_label}'
     say(f'SOCKS5 {bind_host}:{port} into {name} ({engine.cli}, multiplexed, {mode_label})')
     if vnc_front_port and vnc_back_port:
         say(f'VNC guard {bind_host}:{vnc_front_port} -> 127.0.0.1:{vnc_back_port} (LAN only)')
@@ -1060,7 +1062,7 @@ def run_bridge(engine, profile):
     password = auth_password(mode)
     wanted_hash = auth_fingerprint(mode, password)
     bind_host = bind_address(mode)
-    auth = (AUTH_USER, password) if mode == 'all' else None
+    auth = (AUTH_USER, password) if password else None
     lan_only = mode == 'lan'
     vnc_front = desktop_port(profile) if lan_only else None
     vnc_back = desktop_backend_port(profile) if lan_only else None

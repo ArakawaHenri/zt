@@ -12,7 +12,7 @@ Each client gives you a browser-based KasmVNC desktop and a multiplexed SOCKS5 p
 
 - **Single-file, zero-dependency CLI**: one self-contained Python `zipapp` (`zt` on macOS/Linux, `zt.pyz` on Windows; Python stdlib only, no `git` required).
 - **7 clean commands**: `up`, `down`, `status`, `doctor`, `purge`, `accept`, `password`.
-- **Passwordless local default**: binds `127.0.0.1` with no password out of the box; switch to `zt accept lan` (source-IP filtered LAN, no password) or `zt accept all` (`0.0.0.0` with unified password auth on both desktop & SOCKS5).
+- **Passwordless local default**: binds `127.0.0.1` with no password out of the box; switch to `zt accept lan` (source-IP filtered LAN) or `zt accept all` (`0.0.0.0`, password required), and set or clear a password anytime with `zt password [--clear]`.
 - **Persistent login state**: VPN tokens, cookies, device identity (`/etc/machine-id`), and self-signed desktop TLS certs live in per-client engine volumes (`zt-state-<client>`), surviving `zt down`, image upgrades, and `zt accept` / `zt password` switches.
 - **Verified before first use**: every freshly built image is automatically verified against 13 live security & runtime invariants (iptables peer/tunnel drop controls, privilege separation, `NoNewPrivileges`, ELF/library integrity, X11 UI rendering).
 
@@ -80,7 +80,7 @@ zt status [all | client]    show accept mode, platform, container state, desktop
 zt doctor                   check host engine, platform, settings, images, ports, desktops, and bridges
 zt purge [all | client]     stop and delete containers, login state volumes, built images, and host cache
 zt accept [local|lan|all]   set bind scope (default: local); omit argument to show current mode
-zt password                 set or change the password (required for accept all)
+zt password [--clear]       set, change, or clear the password (required for accept all)
 ```
 
 ## Access Modes (`zt accept`)
@@ -89,8 +89,8 @@ zt password                 set or change the password (required for accept all)
 
 | Mode | Bind | Password | Behavior |
 |---|---|---|---|
-| `local` *(default)* | `127.0.0.1` | None | Local machine only — open desktop and use SOCKS5 with zero friction. |
-| `lan` | `0.0.0.0` | None | Containers stay bound to loopback (`127.0.0.1:169x6`); the host bridge exposes `0.0.0.0:169x1` & `0.0.0.0:169x2` and drops any peer outside private/LAN/Tailscale ranges (`127/8`, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`, `::1`, `fc00::/7`, `fe80::/10`). Survives Wi-Fi/DHCP changes without recreating containers. |
+| `local` *(default)* | `127.0.0.1` | Optional | Local machine only — open desktop and use SOCKS5 with zero friction. |
+| `lan` | `0.0.0.0` | Optional | Containers stay bound to loopback (`127.0.0.1:169x6`); the host bridge exposes `0.0.0.0:169x1` & `0.0.0.0:169x2` and drops any peer outside private/LAN/Tailscale ranges (`127/8`, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`, `::1`, `fc00::/7`, `fe80::/10`). Survives Wi-Fi/DHCP changes without recreating containers. |
 | `all` | `0.0.0.0` | Required (6–8 chars) | Enforces unified credentials (`kasm_user` + password from `zt password`) via HTTPS Basic Auth on desktops and RFC 1929 username/password auth on SOCKS5. |
 
 ```sh
@@ -100,7 +100,7 @@ ALL_PROXY=socks5h://127.0.0.1:16912 curl https://internal.corp.example
 # LAN (after `zt accept lan && zt up`)
 ALL_PROXY=socks5h://<lan-host-ip>:16912 curl https://internal.corp.example
 
-# Remote with auth (after `zt accept all && zt up`)
+# With password (after `zt password && zt up`, or `zt accept all && zt up`)
 ALL_PROXY=socks5h://kasm_user:<password>@<host>:16912 curl https://internal.corp.example
 ```
 
@@ -127,7 +127,7 @@ To wipe everything for a clean slate (containers, state volumes, built images, a
 Settings (each overrideable per invocation via `ZT_<KEY>`):
 
 - `ACCEPT`: `local` (default), `lan`, or `all`.
-- `VNC_PW`: 6–8 character password set via `zt password` (used when `ACCEPT=all`).
+- `VNC_PW`: 6–8 character password managed by `zt password` / `zt password --clear` (enforced in all modes when set; required when `ACCEPT=all`).
 - `TRUSTAGENT_BYPASS_ROUTES`: optional comma-separated CIDRs routed via the container's default gateway instead of the TrustAgent VPN tunnel (`table 100 bypass`).
 - `CAPS`: root capability profile — defaults to `least` on Docker (`--cap-drop ALL` + explicit minimal allowlist, `:rw` `/dev/net/tun`, `--pids-limit 1024`) and `all` on Apple Container (per-container microVM); override with `least` or `all`.
 - `ZT_ENGINE`: per-call engine override (`container` or `docker`).
@@ -150,7 +150,7 @@ All images are built locally from the self-contained `overlay/` plus host-cached
 
 Before any newly built image is started, `zt` boots it once on loopback and verifies 13 live invariants:
 
-- **`auth`**: `HTTP 200` directly in `local`/`lan` modes; `401` unauthenticated and `200` authenticated in `all` mode.
+- **`auth`**: `HTTP 200` directly when no password is set; `401` unauthenticated and `200` authenticated whenever a password is active.
 - **Network isolation (`policy`, `tunnel`, `reachability`)**: dedicated `ZT-INPUT` chain at `INPUT` #1 (IPv4 & IPv6) drops unsolicited TCP and UDP from peer containers and VPN tunnels (`tun+`, `utun+`, `vnic+`), verified with two-round positive/negative controls.
 - **Privilege separation (`privilege`, `setuid`, `ownership`, `programs`)**: no `sudo` in base; all desktop UIs run as `kasm-user` with `CapEff=0` and `NoNewPrivs=1`; every systemd unit enforces `NoNewPrivileges=true`; root-executed paths and symlink chains are audited; `kasm-user` owns nothing outside `/home/kasm-user` and declared vendor shared directories.
 - **Runtime integrity (`units`, `ui`, `libraries`, `timezone`, `log`)**: active units, live X11 window checks, native ELF `e_machine` + `ldd` verification, host timezone sync, and clean boot logs.

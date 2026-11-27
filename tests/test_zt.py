@@ -171,7 +171,7 @@ class SettingsAndCrossPlatform(unittest.TestCase):
                     },
                 )
 
-    def test_accept_lan_is_passwordless_and_classifies_lan_ips(self):
+    def test_accept_lan_is_passwordless_by_default_and_honors_password_when_set(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = str(Path(tmp) / 'config')
             env_patch = {k: v for k, v in os.environ.items() if not k.startswith('ZT_')}
@@ -186,6 +186,27 @@ class SettingsAndCrossPlatform(unittest.TestCase):
                     config.container_env('atrust'),
                     {'ZT_NET_MODE': 'gateway', 'ZT_AUTH': '0', 'TZ': 'Asia/Shanghai'},
                 )
+
+            # Orthogonal auth: setting VNC_PW activates auth in local and lan modes too.
+            for mode in ('local', 'lan'):
+                env_pw = {**env_patch, 'ZT_ACCEPT': mode, 'ZT_VNC_PW': 's3cret'}
+                with mock.patch.dict(os.environ, env_pw, clear=True), \
+                        mock.patch.object(config, 'host_timezone', return_value='Asia/Shanghai'):
+                    self.assertEqual(config.auth_password(), 's3cret')
+                    self.assertTrue(config.auth_fingerprint())
+                    self.assertEqual(
+                        config.container_env('atrust'),
+                        {'ZT_NET_MODE': 'gateway', 'ZT_AUTH': '1', 'VNC_PW': 's3cret', 'TZ': 'Asia/Shanghai'},
+                    )
+                # Non-empty invalid password fails closed even in local/lan mode.
+                env_bad = {**env_patch, 'ZT_ACCEPT': mode, 'ZT_VNC_PW': '123'}
+                with mock.patch.dict(os.environ, env_bad, clear=True), \
+                        contextlib.redirect_stderr(io.StringIO()), \
+                        self.assertRaises(SystemExit):
+                    config.container_env('atrust')
+            self.assertFalse(bridge.bridge_matches('local', '', bridge.BRIDGE_PROTO, 'local', 'abc123'))
+            self.assertFalse(bridge.bridge_matches('lan', 'abc123', bridge.BRIDGE_PROTO, 'lan', ''))
+            self.assertTrue(bridge.bridge_matches('lan', 'abc123', bridge.BRIDGE_PROTO, 'lan', 'abc123'))
         for allowed in (
             '127.0.0.1', '10.0.0.5', '172.16.1.2', '172.31.255.1',
             '192.168.1.20', '169.254.1.1', '100.64.0.1', '100.127.255.254',
@@ -1613,10 +1634,43 @@ class EncapsulatedCLI(unittest.TestCase):
                 self.assertEqual(config.accept_mode(), 'all')
                 self.assertIn('0.0.0.0', out.getvalue())
 
+                # Cannot --clear while accept mode is 'all' (fail-closed).
+                with contextlib.redirect_stderr(io.StringIO()) as err, \
+                        self.assertRaises(SystemExit):
+                    cli.main(['password', '--clear'])
+                self.assertIn('cannot clear password while accept mode is "all"', err.getvalue())
+                self.assertEqual(config.setting('VNC_PW'), 's3cret')
+
+                # Switching back to local keeps existing password (orthogonal) until --clear.
                 with contextlib.redirect_stdout(io.StringIO()) as out:
                     cli.main(['accept', 'local'])
                 self.assertEqual(config.accept_mode(), 'local')
                 self.assertIn('127.0.0.1', out.getvalue())
+                self.assertEqual(config.setting('VNC_PW'), 's3cret')
+                self.assertEqual(config.auth_password(), 's3cret')
+
+                # --clear removes VNC_PW atomically while keeping ACCEPT intact.
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    cli.main(['password', '--clear'])
+                self.assertIn('Password cleared', out.getvalue())
+                self.assertEqual(config.setting('VNC_PW'), '')
+                self.assertEqual(config.accept_mode(), 'local')
+                self.assertEqual(config.auth_password(), '')
+                self.assertEqual(os.listdir(tmp), ['config'])
+                if os.name != 'nt':
+                    self.assertEqual(cfg.stat().st_mode & 0o777, 0o600)
+
+                # Calling --clear when no password is set is clean & idempotent.
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    cli.main(['password', '--clear'])
+                self.assertIn('No password is set.', out.getvalue())
+
+                # --clear refuses if ZT_VNC_PW comes from environment.
+                with mock.patch.dict(os.environ, {'ZT_VNC_PW': 's3cret'}), \
+                        contextlib.redirect_stderr(io.StringIO()) as err, \
+                        self.assertRaises(SystemExit):
+                    cli.main(['password', '--clear'])
+                self.assertIn('ZT_VNC_PW is set in the environment', err.getvalue())
 
     def test_ensure_image_promotes_only_after_verify_and_stays_fail_closed_on_retry(self):
         ref = build.current_ref('atrust', 'arm64')
@@ -1681,7 +1735,7 @@ class EncapsulatedCLI(unittest.TestCase):
         self.assertEqual(args.kwargs['arch'], 'amd64')
         self.assertEqual(args.kwargs['volume'], 'zt-state-atrust')
 
-    def test_doctor_does_not_require_password_in_local_or_lan_mode_but_enforces_in_all_mode(self):
+    def test_doctor_checks_orthogonal_password_across_all_accept_modes(self):
         eng = mock.Mock(cli='container', display_name='Apple Container')
         eng.is_installed.return_value = False
         with tempfile.TemporaryDirectory() as tmp:
@@ -1692,8 +1746,29 @@ class EncapsulatedCLI(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()) as out, \
                         self.assertRaises(SystemExit):
                     cli.cmd_doctor(argparse.Namespace())
-                self.assertIn(f'OK   password              not required (accept {mode})', out.getvalue())
+                self.assertIn('OK   password              not set (passwordless)', out.getvalue())
                 self.assertIn('OK   target platform', out.getvalue())
+
+                with mock.patch.object(cli, 'make_engine', return_value=eng), \
+                        mock.patch.dict(os.environ, {'ZT_CONFIG': cfg, 'ZT_ACCEPT': mode, 'ZT_VNC_PW': 's3cret'}), \
+                        contextlib.redirect_stdout(io.StringIO()) as out, \
+                        self.assertRaises(SystemExit):
+                    cli.cmd_doctor(argparse.Namespace())
+                self.assertIn('OK   password              set (required on desktop and SOCKS5', out.getvalue())
+
+                with mock.patch.object(cli, 'make_engine', return_value=eng), \
+                        mock.patch.dict(os.environ, {'ZT_CONFIG': cfg, 'ZT_ACCEPT': mode, 'ZT_VNC_PW': 'bad'}), \
+                        contextlib.redirect_stdout(io.StringIO()) as out, \
+                        self.assertRaises(SystemExit):
+                    cli.cmd_doctor(argparse.Namespace())
+                self.assertIn('FAIL password              must be 6 to 8 characters (got 3)', out.getvalue())
+
+            with mock.patch.object(cli, 'make_engine', return_value=eng), \
+                    mock.patch.dict(os.environ, {'ZT_CONFIG': cfg, 'ZT_ACCEPT': 'all', 'ZT_VNC_PW': ''}), \
+                    contextlib.redirect_stdout(io.StringIO()) as out, \
+                    self.assertRaises(SystemExit):
+                cli.cmd_doctor(argparse.Namespace())
+            self.assertIn('FAIL password              required for accept all', out.getvalue())
 
             with mock.patch.object(cli, 'make_engine', return_value=eng), \
                     mock.patch.dict(os.environ, {'ZT_CONFIG': cfg, 'ZT_ACCEPT': 'all', 'ZT_VNC_PW': 'too-long-12345'}), \

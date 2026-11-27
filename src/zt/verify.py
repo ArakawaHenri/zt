@@ -304,7 +304,7 @@ def verify(engine, profile, mode=None, arch=None, keep=False, ref=None):
                 failures.append('      ' + line)
         else:
             url = f'https://127.0.0.1:{port}/'
-            if mode == 'all':
+            if env.get('ZT_AUTH') == '1':
                 unauth = status
                 authed = http_status(url, auth=(AUTH_USER, env['VNC_PW']))
                 auth_ok = unauth == 401 and authed == 200

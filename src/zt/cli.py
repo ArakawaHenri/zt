@@ -25,6 +25,7 @@ from zt.config import (
     cache_dir,
     config_file,
     container_env,
+    delete_setting,
     die,
     host_timezone,
     password_valid,
@@ -87,12 +88,12 @@ def ensure_image(engine, profile, mode, arch):
     return ref
 
 
-def _mode_summary(mode):
+def _scope_summary(mode):
     if mode == 'local':
-        return '127.0.0.1, no password'
+        return '127.0.0.1'
     if mode == 'lan':
-        return '0.0.0.0 LAN only, no password'
-    return f'0.0.0.0, password required, user {AUTH_USER}'
+        return '0.0.0.0 LAN only'
+    return '0.0.0.0'
 
 
 def ensure_container(engine, profile, env, mode, arch=None):
@@ -171,16 +172,27 @@ def _prompt_and_save_password():
 
 
 def cmd_password(args):
+    if getattr(args, 'clear', False):
+        if 'ZT_VNC_PW' in os.environ:
+            die('ZT_VNC_PW is set in the environment; unset it to clear the password')
+        if accept_mode() == 'all':
+            die('cannot clear password while accept mode is "all"; run "zt accept local" or "zt accept lan" first')
+        path, removed = delete_setting('VNC_PW')
+        if removed:
+            say(f'Password cleared from {path}')
+            say('Run "zt up" to apply to running clients.')
+        else:
+            say('No password is set.')
+        return
     _prompt_and_save_password()
-    if accept_mode() == 'all':
-        say('Run "zt up" to apply the new password to running clients.')
+    say('Run "zt up" to apply to running clients.')
 
 
 def cmd_accept(args):
     if not args.mode:
         mode = accept_mode()
         source = 'from ZT_ACCEPT' if 'ZT_ACCEPT' in os.environ else f'config: {config_file()}'
-        say(f'{mode} ({_mode_summary(mode)}; {source})')
+        say(f'{mode} ({_scope_summary(mode)}; {source})')
         return
 
     if 'ZT_ACCEPT' in os.environ:
@@ -194,7 +206,7 @@ def cmd_accept(args):
         _prompt_and_save_password()
 
     write_setting('ACCEPT', target)
-    say(f'accept set to {target} ({_mode_summary(target)}); run "zt up" to apply')
+    say(f'accept set to {target} ({_scope_summary(target)}); run "zt up" to apply')
 
 
 def cmd_up(args):
@@ -314,12 +326,14 @@ def cmd_status(args=None, engine=None):
     mode = accept_mode()
     bind_host = bind_address(mode)
     password = setting('VNC_PW')
-    auth = (AUTH_USER, password) if (mode == 'all' and password_valid(password)) else None
-    wanted_hash = auth_fingerprint(mode, password) if (mode != 'all' or auth) else ''
+    pw_ok = bool(password) and password_valid(password)
+    auth = (AUTH_USER, password) if pw_ok else None
+    wanted_hash = auth_fingerprint(mode, password) if pw_ok else ''
     target = getattr(args, 'target', 'all') if args is not None else 'all'
     profiles = resolve_targets(target)
 
-    say(f'accept: {mode} ({_mode_summary(mode)}) | platform: {platform_for(arch)}')
+    auth_summary = f'password ({AUTH_USER})' if auth else ('invalid' if password else 'none')
+    say(f'accept: {mode} ({_scope_summary(mode)}) | auth: {auth_summary} | platform: {platform_for(arch)}')
     say(f'{"client":<12} {"container":<10} {"image":<8} {"desktop":<26} socks')
     foreign = False
     for profile in profiles:
@@ -382,18 +396,20 @@ def cmd_doctor(args):
     check('accept mode', True, f'{mode} ({bind_host})')
 
     password = setting('VNC_PW')
-    pw_ok = password_valid(password)
-    if mode == 'all':
-        pw_detail = (
-            ''
-            if pw_ok
-            else f'must be 6 to 8 characters (got {len(password)}); run "zt password"'
-            if password
-            else 'required for accept all; run "zt password"'
-        )
-        check('password', pw_ok, pw_detail)
+    pw_ok = bool(password) and password_valid(password)
+    if not password:
+        if mode == 'all':
+            check('password', False, 'required for accept all; run "zt password"')
+        else:
+            check('password', True, 'not set (passwordless)')
+    elif pw_ok:
+        check('password', True, f'set (required on desktop and SOCKS5, user {AUTH_USER})')
     else:
-        check('password', True, f'not required (accept {mode})')
+        check(
+            'password',
+            False,
+            f'must be 6 to 8 characters (got {len(password)}); run "zt password"',
+        )
 
     zone = host_timezone()
     tz_missing = (
@@ -435,8 +451,8 @@ def cmd_doctor(args):
         built = engine.image_exists(ref)
         check(f'image {name}', built, ref if built else 'not built (built automatically by zt up)')
 
-    auth = (AUTH_USER, password) if (mode == 'all' and pw_ok) else None
-    wanted_hash = auth_fingerprint(mode, password) if (mode != 'all' or auth) else ''
+    auth = (AUTH_USER, password) if pw_ok else None
+    wanted_hash = auth_fingerprint(mode, password) if pw_ok else ''
 
     for profile in CLIENTS:
         up = engine.container_state(profile) == 'running'
@@ -444,14 +460,13 @@ def cmd_doctor(args):
         if up:
             url = desktop_url(profile, bind_host='127.0.0.1')
             unauth = http_status(url)
-            if mode == 'all':
-                if pw_ok:
-                    authed = http_status(url, auth=auth)
-                    good = unauth == 401 and authed == 200
-                    detail = f'{desktop_url(profile, bind_host=bind_host)} ({unauth} unauth / {authed} auth)'
-                else:
-                    good = False
-                    detail = 'password missing for accept all'
+            if auth is not None:
+                authed = http_status(url, auth=auth)
+                good = unauth == 401 and authed == 200
+                detail = f'{desktop_url(profile, bind_host=bind_host)} ({unauth} unauth / {authed} auth)'
+            elif mode == 'all' or password:
+                good = False
+                detail = 'password invalid or missing'
             else:
                 good = unauth == 200
                 detail = f'{desktop_url(profile, bind_host=bind_host)} answers {unauth}'
@@ -515,9 +530,10 @@ def main(argv=None):
         description='Zero-trust VPN client desktops with SOCKS5 proxy (TrustAgent, aTrust, EasyConnect).',
         epilog=(
             'By default zt accepts local connections only (127.0.0.1) with no password. '
-            'Run "zt accept lan" for passwordless LAN access (source-IP filtered), or '
-            '"zt accept all" for open remote access (0.0.0.0) with password authentication '
-            'on both web desktops and SOCKS5 ports.'
+            'Run "zt accept lan" for LAN access (source-IP filtered) or "zt accept all" for '
+            'open remote access (0.0.0.0, password required). Run "zt password" to enable '
+            'password auth on both web desktops and SOCKS5 in any mode, or "zt password --clear" '
+            'to remove it.'
         ),
     )
     parser.add_argument('--version', action='version', version=f'zt {VERSION}')
@@ -539,13 +555,18 @@ def main(argv=None):
 
     accepting = commands.add_parser(
         'accept',
-        help='choose bind scope: local (127.0.0.1), lan (0.0.0.0 LAN only), or all (0.0.0.0 + password)',
-        description='choose bind scope: local (127.0.0.1), lan (0.0.0.0 LAN only), or all (0.0.0.0 + password)',
+        help='choose bind scope: local (127.0.0.1), lan (0.0.0.0 LAN only), or all (0.0.0.0, requires password)',
+        description='choose bind scope: local (127.0.0.1), lan (0.0.0.0 LAN only), or all (0.0.0.0, requires password)',
     )
     accepting.add_argument('mode', nargs='?', choices=ACCEPT_MODES)
     accepting.set_defaults(handler=cmd_accept)
 
-    add('password', 'set or change the password silently (required for accept all)', cmd_password)
+    pw_cmd = add(
+        'password',
+        'set, change, or --clear the password (active in all modes when set; required for accept all)',
+        cmd_password,
+    )
+    pw_cmd.add_argument('--clear', action='store_true', help='remove the saved password (disallowed under accept all)')
 
     args = parser.parse_args(argv)
     if not getattr(args, 'handler', None):
