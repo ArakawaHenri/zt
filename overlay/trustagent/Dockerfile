@@ -3,7 +3,7 @@
 #
 # Built from SHA256-verified official Ubuntu compat libs (libssl1.1 / libevent)
 # and the SHA256-pinned TrustAgent .deb mirror (Qianxin has no anonymous public CDN).
-ARG BASE_IMAGE
+ARG BASE_IMAGE=localhost/zt-base:local
 
 FROM ubuntu:24.04 AS vendor
 COPY ./blobs/ /blobs/
@@ -39,7 +39,9 @@ COPY ./rootfs/ /
 RUN app=/opt/apps/com.qianxin.trustagent \
     && bin="$app/files/bin" \
     && lib="$app/files/lib" \
-    && chmod 0755 /usr/local/bin/zt-init /usr/local/bin/zt-net-setup.sh \
+    && chmod 0755 /etc /etc/systemd /etc/systemd/system /etc/udev /etc/udev/rules.d \
+                  /etc/zt /etc/zt/openbox /usr /usr/bin /usr/local /usr/local/bin \
+                  /usr/local/bin/zt-init /usr/local/bin/zt-net-setup.sh \
                   /usr/bin/nmcli /usr/local/bin/zt-trustagent-routes.sh \
                   /usr/local/bin/zt-vnic-add.sh /usr/local/bin/zt-vnic-remove.sh \
     && chmod 0644 /etc/systemd/system/zt-net.service /etc/systemd/system/zt-socks.service \

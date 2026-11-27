@@ -3,7 +3,7 @@
 #
 # Built directly from the SHA256-verified official Sangfor aTrust arm64 .deb
 # (atrustcdn.sangfor.com) with zero third-party git repositories.
-ARG BASE_IMAGE
+ARG BASE_IMAGE=localhost/zt-base:local
 
 FROM ${BASE_IMAGE} AS shims
 USER root
@@ -48,7 +48,11 @@ RUN chmod 0755 /usr/bin/loginctl /usr/sbin/sysctl-hook /tmp/install-deb.sh \
 
 COPY ./rootfs/ /
 
-RUN chmod 0755 /usr/local/bin/zt-init /usr/local/bin/zt-net-setup.sh \
+RUN chmod 0755 /etc /etc/systemd /etc/systemd/system \
+               /etc/systemd/system/aTrustDaemon.service.d \
+               /etc/systemd/system/eaio_service.service.d \
+               /etc/zt /usr /usr/bin /usr/local /usr/local/bin /usr/sbin \
+               /usr/local/bin/zt-init /usr/local/bin/zt-net-setup.sh \
                /usr/bin/xdg-open /usr/bin/loginctl /usr/sbin/sysctl-hook \
                /usr/local/bin/zt-sangfor-session.sh \
     && chmod 0644 /etc/systemd/system/zt-net.service /etc/systemd/system/zt-socks.service \

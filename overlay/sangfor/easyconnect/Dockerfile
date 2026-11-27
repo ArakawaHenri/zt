@@ -4,7 +4,7 @@
 # Built directly from the SHA256-verified official Sangfor archive
 # (download.sangfor.com.cn) and official Electron 1.8.8 arm64 release
 # (github.com/electron/electron) with zero third-party git repositories.
-ARG BASE_IMAGE
+ARG BASE_IMAGE=localhost/zt-base:local
 
 FROM ${BASE_IMAGE}
 USER root
@@ -71,7 +71,13 @@ RUN chmod 0755 /tmp/install-deb.sh \
 
 COPY ./rootfs/ /
 
-RUN chmod 0755 /usr/local/bin/zt-init /usr/local/bin/zt-net-setup.sh \
+RUN chmod 0755 /etc /etc/systemd /etc/systemd/system \
+               /etc/systemd/system/EasyMonitor.service.d /etc/zt \
+               /usr /usr/bin /usr/local /usr/local/bin \
+               /usr/share /usr/share/sangfor /usr/share/sangfor/EasyConnect \
+               /usr/share/sangfor/EasyConnect/resources \
+               /usr/share/sangfor/EasyConnect/resources/shell \
+               /usr/local/bin/zt-init /usr/local/bin/zt-net-setup.sh \
                /usr/bin/xdg-open /usr/local/bin/zt-conf.sh \
                /usr/local/bin/zt-sangfor-session.sh \
                /usr/share/sangfor/EasyConnect/resources/shell/open_browser.sh \

@@ -366,6 +366,42 @@ class OverlayAndBuildDAG(unittest.TestCase):
         for name in resources.overlay_files():
             self.assertTrue(name.startswith(prefixes), name)
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX umask/chmod test')
+    def test_build_context_normalizes_modes_under_linux_umask_0002(self):
+        old_umask = os.umask(0o002)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                dummy_blob = Path(tmp) / 'dummy.deb'
+                dummy_blob.write_bytes(b'deb')
+                with mock.patch.dict(os.environ, {'ZT_CACHE': tmp}), \
+                        mock.patch.object(build, 'fetch_blob', return_value=dummy_blob):
+                    ctx, _ = build.build_context('trustagent', 'amd64')
+                    for dirpath, dirnames, filenames in os.walk(ctx):
+                        self.assertEqual(Path(dirpath).stat().st_mode & 0o777, 0o755, dirpath)
+                        for fname in filenames:
+                            full = Path(dirpath, fname)
+                            self.assertFalse(full.stat().st_mode & 0o022, str(full))
+
+                    # Poison cached context dirs back to 0775 (pre-fix Linux cache) and verify self-healing.
+                    for bad_rel in ('rootfs/usr', 'rootfs/usr/bin', 'rootfs/etc', 'rootfs/etc/systemd/system'):
+                        (ctx / bad_rel).chmod(0o775)
+                    ctx2, _ = build.build_context('trustagent', 'amd64')
+                    self.assertEqual(ctx2, ctx)
+                    for bad_rel in ('rootfs/usr', 'rootfs/usr/bin', 'rootfs/etc', 'rootfs/etc/systemd/system'):
+                        self.assertEqual((ctx / bad_rel).stat().st_mode & 0o777, 0o755, bad_rel)
+
+                # Checkout mode canonicalizer strips group/world-write bits even under umask 0002.
+                gw_script = Path(tmp) / 'script.sh'
+                gw_unit = Path(tmp) / 'unit.service'
+                gw_script.write_text('#!/bin/sh\n', encoding='utf-8')
+                gw_unit.write_text('[Unit]\n', encoding='utf-8')
+                gw_script.chmod(0o775)
+                gw_unit.chmod(0o664)
+                self.assertEqual(resources._checkout_mode('common/rootfs/x', gw_script), 0o755)
+                self.assertEqual(resources._checkout_mode('common/rootfs/y', gw_unit), 0o644)
+        finally:
+            os.umask(old_umask)
+
     def test_official_multiarch_blob_sources_and_sha256_pins(self):
         for arch in spec.SUPPORTED_ARCHES:
             for name, item in (('base', spec.BASE), *spec.CLIENTS.items()):

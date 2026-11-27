@@ -35,7 +35,7 @@ def _file_mode(path, rel_overlay=None):
         if rel_overlay is not None:
             return 0o755 if rel_overlay in EXECUTABLE_OVERLAYS else 0o644
         return 0o644
-    return path.stat().st_mode & 0o777
+    return 0o755 if (path.stat().st_mode & 0o100) else 0o644
 
 
 def build_zipapp(output=DEFAULT_OUTPUT):

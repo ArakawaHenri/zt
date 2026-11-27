@@ -182,6 +182,31 @@ def _link_or_copy(src, dst):
         shutil.copy2(src, dst)
 
 
+def _normalize_context_modes(root, spec):
+    """Force umask-independent 0755 dir modes and non-group/world-writable overlay file modes.
+
+    Linux distros with user-private-groups default to umask 0002, causing mkdir
+    to create 0775 dirs under the build context; `COPY ./rootfs/ /` would then
+    propagate 0775 onto /etc, /usr, /usr/bin, etc. and fail the `programs` check.
+    """
+    if os.name == 'nt':
+        return
+    expected_files = {key: mode & ~0o022 for key, (_, mode) in overlay_for(spec).items()}
+    root.chmod(0o755)
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames:
+            Path(dirpath, name).chmod(0o755)
+        for name in filenames:
+            full = Path(dirpath, name)
+            rel = full.relative_to(root).as_posix()
+            if rel in expected_files:
+                full.chmod(expected_files[rel])
+            else:
+                mode = full.stat().st_mode & 0o777
+                if mode & 0o022:
+                    full.chmod(mode & ~0o022)
+
+
 def build_context(name, arch=None):
     """Return (context_dir, digest): self-contained overlays + hardlinked verified blobs."""
     arch = arch or target_arch()
@@ -189,6 +214,7 @@ def build_context(name, arch=None):
     digest = content_hash(spec, arch)
     context = cache_dir() / 'build' / f'{name}-{arch}-{digest}'
     if context.is_dir():
+        _normalize_context_modes(context, spec)
         return context, digest
     blobs = [
         (filename, fetch_blob(filename, url, sha256))
@@ -202,12 +228,13 @@ def build_context(name, arch=None):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
             if os.name != 'nt':
-                target.chmod(mode)
+                target.chmod(mode & ~0o022)
         if blobs:
             blobs_target = staging / 'blobs'
             blobs_target.mkdir(parents=True, exist_ok=True)
             for filename, cached_path in blobs:
                 _link_or_copy(cached_path, blobs_target / filename)
+        _normalize_context_modes(staging, spec)
         try:
             staging.rename(context)
         except OSError:

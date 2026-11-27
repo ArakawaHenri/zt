@@ -31,7 +31,9 @@ RUN apt-get update \
 
 COPY ./rootfs/ /
 
-RUN chmod 0755 /usr/local/bin/zt-kasmvnc.sh \
+RUN chmod 0755 /etc /etc/kasmvnc /etc/systemd /etc/systemd/system \
+               /etc/zt /etc/zt/openbox /usr /usr/local /usr/local/bin \
+               /usr/local/bin/zt-kasmvnc.sh \
     && chmod 0644 /etc/kasmvnc/kasmvnc.yaml /etc/systemd/system/kasmvnc.service \
                   /etc/zt/openbox/autostart /etc/zt/openbox/menu.xml \
     && install -d -o root -g root -m 0755 /var/lib/zt-state \

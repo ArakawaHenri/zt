@@ -24,7 +24,7 @@ def _checkout_root():
 def _checkout_mode(rel_posix, path):
     if os.name == 'nt':
         return 0o755 if rel_posix in EXECUTABLE_OVERLAYS else 0o644
-    return path.stat().st_mode & 0o777
+    return 0o755 if (path.stat().st_mode & 0o100) else 0o644
 
 
 def overlay_files():
