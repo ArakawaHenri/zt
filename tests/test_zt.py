@@ -8,6 +8,7 @@ import io
 import ipaddress
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -831,6 +832,17 @@ class SecurityContracts(unittest.TestCase):
             if os.name != 'nt':
                 self.assertEqual((Path(tmp1) / 'dmi/id/product_serial').stat().st_mode & 0o777, 0o444)
                 self.assertEqual((Path(tmp1) / 'dmi/tables/DMI').stat().st_mode & 0o777, 0o444)
+
+            # tmpfs allocates at least one page per non-empty file; ensure size covers every
+            # generated DMI file even on 64 KiB-page ARM64 kernels without ENOSPC.
+            dmi_count = len(list((Path(tmp1) / 'dmi/id').iterdir()))
+            self.assertGreaterEqual(dmi_count, 20)
+            src_text = identity_script.read_text(encoding='utf-8')
+            size_match = re.search(r'size=(\d+)([kmgKMG]?)', src_text)
+            self.assertIsNotNone(size_match, 'zt-identity tmpfs mount must declare explicit size=')
+            unit_scale = {'': 1, 'k': 1024, 'm': 1024 * 1024, 'g': 1024 * 1024 * 1024}
+            size_bytes = int(size_match.group(1)) * unit_scale[size_match.group(2).lower()]
+            self.assertGreaterEqual(size_bytes, dmi_count * 65536)
 
 
 class TheZipapp(unittest.TestCase):

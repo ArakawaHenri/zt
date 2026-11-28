@@ -8,10 +8,12 @@ rootless Podman). Qianxin TrustAgent's libCollectionEngine.so reads
 /sys/firmware/dmi/tables/* and trustdservice's HWFP_V2 fallback reads
 /sys/class/dmi/id/product_serial; aTrust also reads /sys/class/dmi/id/*.
 
-Mounting a fresh 64 KiB read-only tmpfs (never remounting an inherited mount,
-avoiding MNT_LOCK_READONLY EPERM in user namespaces) populated deterministically
-from /etc/machine-id satisfies SMBIOS/DMI consumers identically across Docker,
-Podman, and Apple Container without exposing host hardware IDs.
+Mounting a fresh 4 MiB read-only tmpfs (allocated lazily per page, covering
+21 DMI files on both 4 KiB and 64 KiB page kernels; never remounting an
+inherited mount, avoiding MNT_LOCK_READONLY EPERM in user namespaces) populated
+deterministically from /etc/machine-id satisfies SMBIOS/DMI consumers
+identically across Docker, Podman, and Apple Container without exposing host
+hardware IDs.
 """
 import argparse
 import hashlib
@@ -195,11 +197,11 @@ def _write_dmi_id(id_dir, fields):
 
 
 def _mount_fresh_ro_tmpfs(target_dir, populate_fn):
-    """Overlay `target_dir` with a fresh 64 KiB read-only tmpfs (userns-safe)."""
+    """Overlay `target_dir` with a fresh 4 MiB read-only tmpfs (userns-safe)."""
     if not target_dir.is_dir():
         return
     proc = subprocess.run(
-        ['mount', '-t', 'tmpfs', '-o', 'rw,nosuid,nodev,noexec,size=64k', 'tmpfs', str(target_dir)],
+        ['mount', '-t', 'tmpfs', '-o', 'rw,nosuid,nodev,noexec,size=4m', 'tmpfs', str(target_dir)],
         capture_output=True, text=True, check=False,
     )
     if proc.returncode != 0:
