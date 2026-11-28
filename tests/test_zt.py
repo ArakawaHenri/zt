@@ -1543,6 +1543,10 @@ class MultiplexedBridge(unittest.TestCase):
                     "EVENTS_PATH = '/run/zt-events/latest.json'",
                     f'EVENTS_PATH = {str(events_file)!r}',
                     1,
+                ).replace(
+                    "PROC_DIR = '/proc'",
+                    "PROC_DIR = ''",
+                    1,
                 )
 
                 class CallbackMuxTunnel(bridge.HostMuxTunnel):
@@ -1720,18 +1724,24 @@ class MultiplexedBridge(unittest.TestCase):
         asyncio.run(boot_refresh_scenario())
 
         # 2. Dual-stack listener gracefully falls back to IPv4 on IPv6 EAFNOSUPPORT without leaking sockets
+        #    (patch `bridge.socket` module attribute — never replace global `socket.socket` class, which
+        #    breaks Windows ProactorEventLoop's `isinstance(conn, socket.socket)` check on its self-pipe).
         async def dual_stack_fallback():
-            real_socket = bridge.socket.socket
+            class _Ipv4OnlySocketModule:
+                has_ipv6 = True
 
-            def ipv4_only_socket(family=socket.AF_INET, *args, **kwargs):
-                if family == socket.AF_INET6:
-                    raise OSError(socket.errno.EAFNOSUPPORT, 'no ipv6')
-                return real_socket(family, *args, **kwargs)
+                def __getattr__(self, name):
+                    return getattr(socket, name)
+
+                def socket(self, family=socket.AF_INET, *args, **kwargs):
+                    if family == socket.AF_INET6:
+                        raise OSError(socket.errno.EAFNOSUPPORT, 'no ipv6')
+                    return socket.socket(family, *args, **kwargs)
 
             async def noop(_r, _w):
                 pass
 
-            with mock.patch.object(bridge.socket, 'socket', side_effect=ipv4_only_socket):
+            with mock.patch.object(bridge, 'socket', _Ipv4OnlySocketModule()):
                 servers = await bridge._start_dual_stack_servers(noop, '127.0.0.1', 0)
             try:
                 self.assertEqual(len(servers), 1)
@@ -1741,6 +1751,38 @@ class MultiplexedBridge(unittest.TestCase):
                     await srv.wait_closed()
 
         asyncio.run(dual_stack_fallback())
+
+        # 2b. Windows ProactorEventLoop TransportSocket lacks .ioctl(): _enable_tcp_keepalive must
+        #     still enable SO_KEEPALIVE without raising AttributeError, while calling .ioctl() when present.
+        class _FakeTransportSocket:
+            def __init__(self):
+                self.opts = []
+
+            def setsockopt(self, level, optname, value):
+                self.opts.append((level, optname, value))
+
+        class _FakeWinRawSocket(_FakeTransportSocket):
+            def __init__(self):
+                super().__init__()
+                self.ioctls = []
+
+            def ioctl(self, control, option):
+                self.ioctls.append((control, option))
+
+        class _FakeWinSocketModule:
+            SIO_KEEPALIVE_VALS = 0x98000004
+
+            def __getattr__(self, name):
+                return getattr(socket, name)
+
+        tr_sock = _FakeTransportSocket()
+        raw_sock = _FakeWinRawSocket()
+        with mock.patch.object(bridge.os, 'name', 'nt'), \
+                mock.patch.object(bridge, 'socket', _FakeWinSocketModule()):
+            bridge._enable_tcp_keepalive(tr_sock, idle=60, interval=15)
+            bridge._enable_tcp_keepalive(raw_sock, idle=60, interval=15)
+        self.assertIn((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1), tr_sock.opts)
+        self.assertEqual(raw_sock.ioctls, [(0x98000004, (1, 60000, 15000))])
 
         # 3. _discover_keepalive_target prioritizes non-loopback resolv.conf DNS -> route gw -> subnet peer
         with tempfile.TemporaryDirectory() as tmp:

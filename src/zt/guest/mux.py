@@ -99,6 +99,7 @@ KEEPALIVE_IDLE_SECONDS = 180.0      # Zero-config passive idle tunnel keepalive 
 KEEPALIVE_PROBE_TIMEOUT = 2.0
 
 EVENTS_PATH = '/run/zt-events/latest.json'
+PROC_DIR = '/proc'
 STATE_MOUNT_PATH = '/var/lib/zt-state'
 SSO_URL_FRESH_SECONDS = 300
 STATIC_CALLBACK_ALLOWLIST = frozenset((39301, 54631, 54530))
@@ -368,11 +369,14 @@ def _interleave_v4_first(addrs):
     return tuple(ordered)
 
 
-def _detect_tunnel_iface():
+def _detect_tunnel_iface(proc_dir=None):
     """Return active VPN tunnel interface name (if UP and routed/running), else ''."""
+    root = PROC_DIR if proc_dir is None else proc_dir
+    if not root:
+        return ''
     ifaces = []
     try:
-        with open('/proc/net/dev', encoding='utf-8', errors='replace') as handle:
+        with open(os.path.join(root, 'net', 'dev'), encoding='utf-8', errors='replace') as handle:
             for line in handle:
                 if ':' not in line:
                     continue
@@ -386,7 +390,7 @@ def _detect_tunnel_iface():
 
     routed = set()
     try:
-        with open('/proc/net/route', encoding='utf-8', errors='replace') as handle:
+        with open(os.path.join(root, 'net', 'route'), encoding='utf-8', errors='replace') as handle:
             next(handle, None)
             for line in handle:
                 parts = line.split()
@@ -408,19 +412,20 @@ def _detect_tunnel_iface():
     return ''
 
 
-def _check_daemon_alive(profile):
+def _check_daemon_alive(profile, proc_dir=None):
     """Best-effort check whether expected VPN daemon processes exist in /proc."""
     wanted = _PROFILE_DAEMONS.get(profile)
-    if not wanted or not os.path.isdir('/proc'):
+    root = PROC_DIR if proc_dir is None else proc_dir
+    if not wanted or not root or not os.path.isdir(root):
         return True
     visible_pids = 0
     try:
-        for entry in os.listdir('/proc'):
+        for entry in os.listdir(root):
             if not entry.isdigit():
                 continue
             visible_pids += 1
             try:
-                with open(f'/proc/{entry}/comm', encoding='utf-8', errors='replace') as handle:
+                with open(os.path.join(root, entry, 'comm'), encoding='utf-8', errors='replace') as handle:
                     comm = handle.read().strip()
             except OSError:
                 continue
@@ -432,9 +437,13 @@ def _check_daemon_alive(profile):
     return visible_pids <= 2
 
 
-def _has_local_dns_listener():
+def _has_local_dns_listener(proc_dir=None):
     """True when any local socket is bound to UDP/TCP port 53 (0x0035)."""
-    for path in ('/proc/net/udp', '/proc/net/udp6', '/proc/net/tcp', '/proc/net/tcp6'):
+    root = PROC_DIR if proc_dir is None else proc_dir
+    if not root:
+        return False
+    for name in ('udp', 'udp6', 'tcp', 'tcp6'):
+        path = os.path.join(root, 'net', name)
         try:
             with open(path, encoding='utf-8', errors='replace') as handle:
                 next(handle, None)
@@ -823,6 +832,7 @@ class GuestMux:
         udp_idle_ttl=UDP_IDLE_TTL,
         keepalive_idle=KEEPALIVE_IDLE_SECONDS,
         keepalive_probe_fn=None,
+        proc_dir=None,
     ):
         self.profile = profile or ''
         # Defense-in-depth: intersect CLI-supplied ports with hardcoded static allowlist.
@@ -830,6 +840,7 @@ class GuestMux:
             int(p) for p in callback_ports if int(p) in STATIC_CALLBACK_ALLOWLIST
         )
         self._events_path = events_path
+        self._proc_dir = proc_dir
         self._max_tcp_streams = max_tcp_streams
         self._max_udp_assocs = max_udp_assocs
         self._udp_idle_ttl = udp_idle_ttl
@@ -1175,8 +1186,12 @@ class GuestMux:
     def collect_health(self):
         """Return compact JSON-serializable container VPN/DNS/daemon/volume health dict."""
         now = int(time.time())
-        iface = _detect_tunnel_iface()
-        daemon_ok = _check_daemon_alive(self.profile)
+        iface = _detect_tunnel_iface() if self._proc_dir is None else _detect_tunnel_iface(self._proc_dir)
+        daemon_ok = (
+            _check_daemon_alive(self.profile)
+            if self._proc_dir is None
+            else _check_daemon_alive(self.profile, self._proc_dir)
+        )
         dns_ok = _check_dns_ok()
         used_pct, avail_mb = _state_volume_usage()
 
@@ -1301,7 +1316,7 @@ class GuestMux:
         """Trigger at most one lightweight probe per `keepalive_idle` window when tunnel is UP & idle."""
         if self._keepalive_idle <= 0:
             return False
-        iface = _detect_tunnel_iface()
+        iface = _detect_tunnel_iface() if self._proc_dir is None else _detect_tunnel_iface(self._proc_dir)
         if not iface:
             self._last_tunnel_tx = None
             return False

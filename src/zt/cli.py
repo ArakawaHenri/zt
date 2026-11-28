@@ -523,7 +523,7 @@ def _check_linux_host_prechecks(engine, arch, check):
             check('apparmor userns', True, f'restrict={aa_val or "unknown"}')
 
     if is_rootless:
-        uid = os.getuid()
+        uid = getattr(os, 'getuid', lambda: 0)()
         cg_ctrl = Path(f'/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/cgroup.controllers')
         if cg_ctrl.is_file():
             try:

@@ -340,25 +340,27 @@ def _enable_tcp_keepalive(sock, idle=60, interval=15, count=4):
     """Best-effort cross-platform TCP keepalive so dead peers do not leak sockets/tasks."""
     if sock is None:
         return
-    with contextlib.suppress(OSError):
+    with contextlib.suppress(OSError, AttributeError):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     if os.name == 'nt' and hasattr(socket, 'SIO_KEEPALIVE_VALS'):
-        with contextlib.suppress(OSError, ValueError):
-            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle * 1000, interval * 1000))
+        ioctl = getattr(sock, 'ioctl', None)
+        if callable(ioctl):
+            with contextlib.suppress(OSError, ValueError, AttributeError):
+                ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle * 1000, interval * 1000))
         return
     keepidle = getattr(socket, 'TCP_KEEPIDLE', None)
     if keepidle is None:
         keepidle = getattr(socket, 'TCP_KEEPALIVE', None)
     if keepidle is not None:
-        with contextlib.suppress(OSError):
+        with contextlib.suppress(OSError, AttributeError):
             sock.setsockopt(socket.IPPROTO_TCP, keepidle, idle)
     keepintvl = getattr(socket, 'TCP_KEEPINTVL', None)
     if keepintvl is not None:
-        with contextlib.suppress(OSError):
+        with contextlib.suppress(OSError, AttributeError):
             sock.setsockopt(socket.IPPROTO_TCP, keepintvl, interval)
     keepcnt = getattr(socket, 'TCP_KEEPCNT', None)
     if keepcnt is not None:
-        with contextlib.suppress(OSError):
+        with contextlib.suppress(OSError, AttributeError):
             sock.setsockopt(socket.IPPROTO_TCP, keepcnt, count)
 
 
@@ -713,8 +715,10 @@ def _bind_udp_socket(local_ip, scope_id=0):
             with contextlib.suppress(OSError):
                 sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         if os.name == 'nt' and hasattr(socket, 'SIO_UDP_CONNRESET'):
-            with contextlib.suppress(OSError, ValueError):
-                sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+            ioctl = getattr(sock, 'ioctl', None)
+            if callable(ioctl):
+                with contextlib.suppress(OSError, ValueError, AttributeError):
+                    ioctl(socket.SIO_UDP_CONNRESET, False)
         if family == socket.AF_INET6 and ip.is_link_local and scope_id:
             sock.bind((local_ip, 0, 0, scope_id))
         else:
