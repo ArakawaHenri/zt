@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Qianxin TrustAgent client on zt-base (official ubuntu:24.04 + official KasmVNC).
 #
 # Built from SHA256-verified official Ubuntu compat libs (libssl1.1 / libevent)
@@ -21,11 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fonts-wqy-microhei \
         libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 libxcb-xinerama0 libxcb-xinput0 \
         python3-xdg python-is-python3 \
-        psmisc zip net-tools dmidecode mousepad udev bind9-dnsutils \
+        psmisc zip net-tools dmidecode mousepad bind9-dnsutils \
         libqt5core5t64 libqt5gui5 libqt5widgets5 libqt5sql5 libqt5sql5-sqlite \
         libqt5qml5 libqt5quick5 libqt5quickwidgets5 libqt5webchannel5 libqt5websockets5 \
         libqt5webenginecore5 libqt5webenginewidgets5 libqt5svg5 libqt5concurrent5 \
-        libsqlite3-dev microsocks \
+        libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=vendor /build/usr/ /usr/
@@ -39,16 +38,16 @@ COPY ./rootfs/ /
 RUN app=/opt/apps/com.qianxin.trustagent \
     && bin="$app/files/bin" \
     && lib="$app/files/lib" \
-    && chmod 0755 /etc /etc/systemd /etc/systemd/system /etc/udev /etc/udev/rules.d \
-                  /etc/zt /etc/zt/openbox /usr /usr/bin /usr/local /usr/local/bin \
+    && chmod 0755 /etc /etc/systemd /etc/systemd/system \
+                  /etc/zt /etc/zt/openbox /usr /usr/bin /usr/local /usr/local/bin /usr/local/sbin \
                   /usr/local/bin/zt-init /usr/local/bin/zt-net-setup.sh \
-                  /usr/bin/nmcli /usr/local/bin/zt-trustagent-routes.sh \
-                  /usr/local/bin/zt-vnic-add.sh /usr/local/bin/zt-vnic-remove.sh \
-    && chmod 0644 /etc/systemd/system/zt-net.service /etc/systemd/system/zt-socks.service \
+                  /usr/bin/nmcli /usr/bin/xdg-open /usr/local/bin/zt-identity /usr/local/sbin/zt-iptables \
+                  /usr/local/bin/zt-trustagent-routes.sh \
+    && [ "$(readlink /usr/sbin/iptables)" = /usr/local/sbin/zt-iptables ] \
+    && chmod 0644 /etc/systemd/system/zt-net.service \
                   /etc/systemd/system/trustdservice.service /etc/systemd/system/trustservice.service \
                   /etc/systemd/system/trustservicemgr.service /etc/systemd/system/trustnet.service \
-                  /etc/systemd/system/udev-vnic-add@.service /etc/systemd/system/udev-vnic-remove@.service \
-                  /etc/udev/rules.d/99-vnic.rules /etc/zt/state-paths.conf \
+                  /etc/zt/state-paths.conf \
                   /etc/zt/openbox/menu.xml \
     && install -d -m 1777 /var/log/TrustAgent \
     && install -d -m 1777 /usr/share/trustagent \
@@ -73,7 +72,7 @@ RUN app=/opt/apps/com.qianxin.trustagent \
     && chown -R kasm-user:kasm-user /home/kasm-user \
     && chmod -R o-w /home/kasm-user \
     && systemctl enable trustdservice.service trustservice.service trustservicemgr.service \
-                        trustnet.service systemd-udevd.service zt-net.service zt-socks.service
+                        trustnet.service zt-net.service
 
 ENV BYPASS_ROUTES=""
 

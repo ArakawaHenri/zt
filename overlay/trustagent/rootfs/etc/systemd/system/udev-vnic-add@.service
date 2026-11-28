@@ -1,8 +1,0 @@
-[Unit]
-Description=TrustAgent vnic interface add hook (%I)
-
-[Service]
-Type=oneshot
-NoNewPrivileges=true
-RemainAfterExit=no
-ExecStart=/usr/local/bin/zt-vnic-add.sh %i

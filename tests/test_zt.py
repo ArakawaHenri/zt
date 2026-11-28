@@ -38,8 +38,8 @@ EXECUTABLE = tuple(sorted(spec.EXECUTABLE_OVERLAYS))
 UNITS = (
     'base/rootfs/etc/systemd/system/kasmvnc.service',
     'common/rootfs/etc/systemd/system/zt-net.service',
-    'common/rootfs/etc/systemd/system/zt-socks.service',
-    'sangfor/common/rootfs/etc/systemd/system/zt-sangfor.service',
+    'sangfor/common/rootfs/etc/systemd/system/zt-sangfor-daemon.service',
+    'sangfor/common/rootfs/etc/systemd/system/zt-sangfor-ui.service',
     'sangfor/atrust/rootfs/etc/systemd/system/aTrustDaemon.service.d/zt.conf',
     'sangfor/atrust/rootfs/etc/systemd/system/eaio_service.service.d/zt.conf',
     'sangfor/easyconnect/rootfs/etc/systemd/system/EasyMonitor.service.d/zt.conf',
@@ -47,14 +47,14 @@ UNITS = (
     'trustagent/rootfs/etc/systemd/system/trustservice.service',
     'trustagent/rootfs/etc/systemd/system/trustservicemgr.service',
     'trustagent/rootfs/etc/systemd/system/trustnet.service',
-    'trustagent/rootfs/etc/systemd/system/udev-vnic-add@.service',
-    'trustagent/rootfs/etc/systemd/system/udev-vnic-remove@.service',
 )
 SHARED = (
+    'rootfs/usr/bin/xdg-open',
+    'rootfs/usr/local/bin/zt-identity',
     'rootfs/usr/local/bin/zt-init',
     'rootfs/usr/local/bin/zt-net-setup.sh',
+    'rootfs/usr/local/sbin/zt-iptables',
     'rootfs/etc/systemd/system/zt-net.service',
-    'rootfs/etc/systemd/system/zt-socks.service',
 )
 HOME_IS_THE_USERS = 'chown -R kasm-user:kasm-user /home/kasm-user'
 
@@ -149,27 +149,32 @@ class SettingsAndCrossPlatform(unittest.TestCase):
                 )
 
     def test_accept_all_requires_valid_password(self):
+        self.assertFalse(config.password_valid('abc\x00def'))
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(io.StringIO()):
             cfg = str(Path(tmp) / 'config')
-            for rejected in ('', '12345', '123456789', '#abcde', 'abc\ndef', 'abc\rdef', ' abcdef'):
+            for rejected in (
+                '', '12345', 'a' * 129, '#abcde', 'abc\ndef', 'abc\rdef',
+                ' abcdef', 'abc\tdef', '密码123456',
+            ):
                 with mock.patch.dict(
                     os.environ, {'ZT_CONFIG': cfg, 'ZT_ACCEPT': 'all', 'ZT_VNC_PW': rejected}
                 ), self.assertRaises(SystemExit):
                     config.container_env('atrust')
 
-            with mock.patch.dict(
-                os.environ, {'ZT_CONFIG': cfg, 'ZT_ACCEPT': 'all', 'ZT_VNC_PW': 's3cret'}
-            ), mock.patch.object(config, 'host_timezone', return_value='Europe/Paris'):
-                self.assertEqual(config.bind_address(), '0.0.0.0')
-                self.assertEqual(
-                    config.container_env('atrust', net_mode='subnet'),
-                    {
-                        'ZT_NET_MODE': 'subnet',
-                        'ZT_AUTH': '1',
-                        'VNC_PW': 's3cret',
-                        'TZ': 'Europe/Paris',
-                    },
-                )
+            for valid_pw in ('s3cret', 'long-passphrase-1234', 'x' * 128):
+                with mock.patch.dict(
+                    os.environ, {'ZT_CONFIG': cfg, 'ZT_ACCEPT': 'all', 'ZT_VNC_PW': valid_pw}
+                ), mock.patch.object(config, 'host_timezone', return_value='Europe/Paris'):
+                    self.assertEqual(config.bind_address(), '0.0.0.0')
+                    self.assertEqual(
+                        config.container_env('atrust', net_mode='subnet'),
+                        {
+                            'ZT_NET_MODE': 'subnet',
+                            'ZT_AUTH': '1',
+                            'VNC_PW': valid_pw,
+                            'TZ': 'Europe/Paris',
+                        },
+                    )
 
     def test_accept_lan_is_passwordless_by_default_and_honors_password_when_set(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,6 +285,19 @@ class SettingsAndCrossPlatform(unittest.TestCase):
             if os.name != 'nt':
                 self.assertEqual(cfg.stat().st_mode & 0o777, 0o600)
 
+            st = Path(tmp) / 'state'
+            st.mkdir(mode=0o755)
+            if os.name != 'nt':
+                st.chmod(0o755)
+            with mock.patch.dict(os.environ, {'ZT_STATE': str(st)}):
+                bridge._write_pidfile('atrust', 12345, 'docker', 'all', 'deadbeef1234')
+                pid_path = bridge.bridge_pidfile('atrust')
+                self.assertTrue(pid_path.is_file())
+                self.assertEqual(os.listdir(st), [pid_path.name])
+                if os.name != 'nt':
+                    self.assertEqual(st.stat().st_mode & 0o777, 0o700)
+                    self.assertEqual(pid_path.stat().st_mode & 0o777, 0o600)
+
 
 class OverlayAndBuildDAG(unittest.TestCase):
     def test_scripts_executable_and_units_not(self):
@@ -304,8 +322,11 @@ class OverlayAndBuildDAG(unittest.TestCase):
         self.assertIn('rootfs/etc/systemd/system/EasyMonitor.service.d/zt.conf', ec)
         self.assertIn('rootfs/usr/local/bin/zt-conf.sh', ec)
         self.assertNotIn('rootfs/etc/systemd/system/aTrustDaemon.service.d/zt.conf', ec)
-        for name in (*SHARED, 'rootfs/etc/systemd/system/zt-sangfor.service',
-                     'rootfs/usr/local/bin/zt-sangfor-session.sh',
+        for name in (*SHARED,
+                     'rootfs/etc/systemd/system/zt-sangfor-daemon.service',
+                     'rootfs/etc/systemd/system/zt-sangfor-ui.service',
+                     'rootfs/usr/local/bin/zt-sangfor-daemon.sh',
+                     'rootfs/usr/local/bin/zt-sangfor-ui.sh',
                      'rootfs/etc/zt/state-paths.conf', 'Dockerfile'):
             self.assertIn(name, atrust)
             self.assertIn(name, ec)
@@ -371,9 +392,12 @@ class OverlayAndBuildDAG(unittest.TestCase):
         old_umask = os.umask(0o002)
         try:
             with tempfile.TemporaryDirectory() as tmp:
+                dummy_payload = b'deb'
+                dummy_sha = hashlib.sha256(dummy_payload).hexdigest()
                 dummy_blob = Path(tmp) / 'dummy.deb'
-                dummy_blob.write_bytes(b'deb')
+                dummy_blob.write_bytes(dummy_payload)
                 with mock.patch.dict(os.environ, {'ZT_CACHE': tmp}), \
+                        mock.patch.object(build, 'blobs_for', return_value=(('dummy.deb', 'https://example.invalid/dummy.deb', dummy_sha),)), \
                         mock.patch.object(build, 'fetch_blob', return_value=dummy_blob):
                     ctx, _ = build.build_context('trustagent', 'amd64')
                     for dirpath, dirnames, filenames in os.walk(ctx):
@@ -382,7 +406,7 @@ class OverlayAndBuildDAG(unittest.TestCase):
                             full = Path(dirpath, fname)
                             self.assertFalse(full.stat().st_mode & 0o022, str(full))
 
-                    # Poison cached context dirs back to 0775 (pre-fix Linux cache) and verify self-healing.
+                    # Poison cached context dirs back to 0775 (pre-fix Linux cache) and verify self-healing on pure cache hit.
                     for bad_rel in ('rootfs/usr', 'rootfs/usr/bin', 'rootfs/etc', 'rootfs/etc/systemd/system'):
                         (ctx / bad_rel).chmod(0o775)
                     ctx2, _ = build.build_context('trustagent', 'amd64')
@@ -401,6 +425,78 @@ class OverlayAndBuildDAG(unittest.TestCase):
                 self.assertEqual(resources._checkout_mode('common/rootfs/y', gw_unit), 0o644)
         finally:
             os.umask(old_umask)
+
+    def test_build_context_revalidates_cached_blob_sha256_and_rejects_tampering_or_symlinks(self):
+        good_payload = b'good-vendor-deb-bytes'
+        good_sha = hashlib.sha256(good_payload).hexdigest()
+        fetches = 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            source_blob = cache / 'upstream.deb'
+            source_blob.write_bytes(good_payload)
+
+            def fake_fetch(filename, url, expected_sha):
+                nonlocal fetches
+                fetches += 1
+                dest = cache / 'blobs' / expected_sha
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(good_payload)
+                return dest
+
+            with mock.patch.dict(os.environ, {'ZT_CACHE': str(cache)}), \
+                    mock.patch.object(build, 'blobs_for', return_value=(('vendor.deb', 'https://example.invalid/v.deb', good_sha),)), \
+                    mock.patch.object(build, 'fetch_blob', side_effect=fake_fetch):
+                ctx, _ = build.build_context('trustagent', 'arm64')
+                self.assertEqual(fetches, 1)
+
+                # Second call on clean cache MUST reuse without re-fetching.
+                ctx2, _ = build.build_context('trustagent', 'arm64')
+                self.assertEqual(ctx2, ctx)
+                self.assertEqual(fetches, 1)
+
+                # Tamper cached blob bytes -> must warn, delete poisoned cache, and rebuild cleanly!
+                (ctx / 'blobs' / 'vendor.deb').write_bytes(b'tampered!')
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    ctx3, _ = build.build_context('trustagent', 'arm64')
+                self.assertEqual(fetches, 2)
+                self.assertIn('failed SHA256 verification', err.getvalue())
+                self.assertEqual((ctx3 / 'blobs' / 'vendor.deb').read_bytes(), good_payload)
+
+                # Replace cached blob with a symlink (even pointing to valid bytes) -> rejected & rebuilt!
+                if os.name != 'nt':
+                    (ctx3 / 'blobs' / 'vendor.deb').unlink()
+                    (ctx3 / 'blobs' / 'vendor.deb').symlink_to(source_blob)
+                    with contextlib.redirect_stderr(io.StringIO()) as err:
+                        ctx4, _ = build.build_context('trustagent', 'arm64')
+                    self.assertEqual(fetches, 3)
+                    self.assertIn('failed SHA256 verification', err.getvalue())
+                    self.assertFalse((ctx4 / 'blobs' / 'vendor.deb').is_symlink())
+
+    def test_github_workflows_pin_all_actions_to_commit_shas_and_attest_release(self):
+        wf_dir = ROOT / '.github' / 'workflows'
+        workflows = sorted(wf_dir.glob('*.y*ml'))
+        self.assertTrue(workflows, 'expected at least one GitHub Actions workflow')
+        uses_count = 0
+        for wf in workflows:
+            text = wf.read_text(encoding='utf-8')
+            for lineno, line in enumerate(text.splitlines(), 1):
+                stripped = line.strip()
+                if stripped.startswith('- uses:') or stripped.startswith('uses:'):
+                    uses_count += 1
+                    spec_part = stripped.split('uses:', 1)[1].strip()
+                    self.assertRegex(
+                        spec_part,
+                        r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}(\s+#\s*v\S+)?$',
+                        f'{wf.name}:{lineno} action not pinned to 40-char commit SHA: {spec_part!r}',
+                    )
+        self.assertGreaterEqual(uses_count, 5)
+        ci_text = (wf_dir / 'ci.yml').read_text(encoding='utf-8')
+        self.assertIn('verify-container:', ci_text)
+        self.assertIn('python3 -m zt.verify', ci_text)
+        self.assertIn('actions/attest-build-provenance@', ci_text)
+        self.assertIn('attestations: write', ci_text)
+        self.assertIn('id-token: write', ci_text)
 
     def test_official_multiarch_blob_sources_and_sha256_pins(self):
         for arch in spec.SUPPORTED_ARCHES:
@@ -497,9 +593,17 @@ class SecurityContracts(unittest.TestCase):
         self.assertIn('STATE_ROOT=/var/lib/zt-state', init_sh)
         self.assertIn('mountpoint -q "$STATE_ROOT"', init_sh)
         self.assertIn('/etc/machine-id', init_sh)
+        self.assertIn('/var/lib/dbus/machine-id', init_sh)
         self.assertIn('/etc/zt/state-paths.conf', init_sh)
         self.assertIn('mount --bind "$src" "$target"', init_sh)
+        self.assertIn('setpriv --reuid kasm-user --regid kasm-user --init-groups --no-new-privs', init_sh)
+        self.assertIn('chmod 1777 /usr/share/sangfor/.aTrust', init_sh)
         self.assertIn('mount -o remount,rw /sys/fs/cgroup', init_sh)
+        self.assertIn('mount --bind /proc/sys/net/ipv4/conf /proc/sys/net/ipv4/conf', init_sh)
+        self.assertNotIn('mount --bind /proc/sys/net /proc/sys/net', init_sh)
+        self.assertIn('/usr/local/bin/zt-identity', init_sh)
+        self.assertIn('/usr/local/sbin/zt-iptables --init', init_sh)
+        self.assertIn('/run/zt/resolv.orig', init_sh)
         self.assertIn('/etc/zt/openbox', init_sh)
         self.assertIn('openssl req -x509', init_sh)
 
@@ -533,28 +637,200 @@ class SecurityContracts(unittest.TestCase):
         self.assertNotIn('self.pem', kasm_sh)
 
     def test_zt_sangfor_service_has_nnp_and_drops_privs_for_conf_and_x11(self):
-        unit = overlay_text('sangfor/common/rootfs/etc/systemd/system/zt-sangfor.service')
-        self.assertIn('NoNewPrivileges=true', unit)
-        self.assertNotIn('XAUTHORITY=', unit)
-        self.assertEqual(unit.count('setpriv --reuid kasm-user --regid kasm-user --init-groups --no-new-privs'), 3)
+        daemon = overlay_text('sangfor/common/rootfs/etc/systemd/system/zt-sangfor-daemon.service')
+        ui = overlay_text('sangfor/common/rootfs/etc/systemd/system/zt-sangfor-ui.service')
+        self.assertIn('User=root', daemon)
+        self.assertIn('NoNewPrivileges=true', daemon)
+        self.assertIn(
+            'CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_PTRACE',
+            daemon,
+        )
+        self.assertNotIn(' ~CAP_', daemon)
+        self.assertNotIn('XAUTHORITY=', daemon)
+        self.assertNotIn('zt-conf.sh sync', daemon)
+        self.assertIn('setpriv --reuid kasm-user --regid kasm-user --init-groups --no-new-privs', daemon)
+        self.assertIn('User=kasm-user', ui)
+        self.assertIn('Group=kasm-user', ui)
+        self.assertIn('NoNewPrivileges=true', ui)
+        self.assertIn('OOMScoreAdjust=200', ui)
+        self.assertIn('BindsTo=kasmvnc.service', ui)
+        self.assertNotIn('XAUTHORITY=', ui)
+
         conf = overlay_text('sangfor/easyconnect/rootfs/usr/local/bin/zt-conf.sh')
         self.assertNotIn('chown', conf)
+        self.assertNotIn('sync)', conf)
         self.assertIn('cp -rP', conf)
+        if os.name != 'nt':
+            with tempfile.TemporaryDirectory() as tmp:
+                res_dir = Path(tmp) / 'resources'
+                (res_dir / 'conf_backup').mkdir(parents=True)
+                (res_dir / 'conf').mkdir(parents=True)
+                (res_dir / 'conf_backup' / 'default.json').write_text('{"k":1}\n', encoding='utf-8')
+                (res_dir / 'conf_backup' / 'pkg_version.xml').write_text('<v/>\n', encoding='utf-8')
+                (res_dir / 'conf' / 'user.json').write_text('{"user":"keep"}\n', encoding='utf-8')
+                (res_dir / 'conf' / 'ECDomainFile').write_text('stale\n', encoding='utf-8')
+                patched = conf.replace('res=/usr/share/sangfor/EasyConnect/resources', f'res={res_dir}')
+                script_path = Path(tmp) / 'zt-conf.sh'
+                script_path.write_text(patched, encoding='utf-8')
+                script_path.chmod(0o755)
+                run = subprocess.run([str(script_path), 'init'], capture_output=True, text=True, check=False)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual((res_dir / 'conf' / 'default.json').read_text(encoding='utf-8'), '{"k":1}\n')
+                self.assertEqual((res_dir / 'conf' / 'user.json').read_text(encoding='utf-8'), '{"user":"keep"}\n')
+                self.assertFalse((res_dir / 'conf' / 'ECDomainFile').exists())
+                self.assertEqual(os.readlink(res_dir / 'conf' / 'pkg_version.xml'), '/dev/null')
+        ec_state = overlay_text('sangfor/easyconnect/rootfs/etc/zt/state-paths.conf')
+        self.assertIn('easyconnect-conf /usr/share/sangfor/EasyConnect/resources/conf kasm-user:kasm-user 0755', ec_state)
+        at_state = overlay_text('sangfor/atrust/rootfs/etc/zt/state-paths.conf')
+        self.assertIn('atrust-sys /usr/share/sangfor/.aTrust root:root 1777', at_state)
+
+        # Retired Wave 2 artifacts must be completely absent from overlays and Dockerfiles.
+        all_files = resources.overlay_files()
+        for retired in (
+            'common/rootfs/etc/systemd/system/zt-socks.service',
+            'sangfor/common/rootfs/etc/systemd/system/zt-sangfor.service',
+            'sangfor/common/rootfs/usr/bin/xdg-open',
+            'sangfor/atrust/rootfs/usr/local/bin/zt-sangfor-session.sh',
+            'sangfor/easyconnect/rootfs/usr/local/bin/zt-sangfor-session.sh',
+            'trustagent/rootfs/etc/udev/rules.d/99-vnic.rules',
+            'trustagent/rootfs/etc/systemd/system/udev-vnic-add@.service',
+            'trustagent/rootfs/etc/systemd/system/udev-vnic-remove@.service',
+            'trustagent/rootfs/usr/local/bin/zt-vnic-add.sh',
+            'trustagent/rootfs/usr/local/bin/zt-vnic-remove.sh',
+        ):
+            self.assertNotIn(retired, all_files, retired)
+        for name, item in (('base', spec.BASE), *spec.CLIENTS.items()):
+            df = build.overlay_for(item)['Dockerfile'][0].decode('utf-8')
+            self.assertNotIn('microsocks', df, name)
+            self.assertNotIn('zt-socks.service', df, name)
+
+        # Safe universal xdg-open + Openbox menu.xml callback trigger contracts.
+        xdg_sh = overlay_text('common/rootfs/usr/bin/xdg-open')
+        xdg_code = '\n'.join(line for line in xdg_sh.splitlines() if not line.lstrip().startswith('#'))
+        self.assertNotIn('xmessage', xdg_code)
+        self.assertIn('/run/zt-events', xdg_code)
+        self.assertIn('setpriv --reuid kasm-user --regid kasm-user --init-groups --no-new-privs', xdg_code)
+        for menu_rel in (
+            'base/rootfs/etc/zt/openbox/menu.xml',
+            'trustagent/rootfs/etc/zt/openbox/menu.xml',
+        ):
+            menu_xml = overlay_text(menu_rel)
+            self.assertIn('python3 -I', menu_xml, menu_rel)
+            self.assertIn('encoding=', menu_xml, menu_rel)
+            self.assertNotIn('os.fdopen(fd,"w","utf-8")', menu_xml, menu_rel)
+
+        init_sh = overlay_text('common/rootfs/usr/local/bin/zt-init')
+        self.assertIn('/run/zt-events', init_sh)
+        self.assertIn('GPUCache', init_sh)
 
     def test_all_trustagent_vendor_units_have_nnp(self):
-        for unit in ('trustdservice', 'trustservice', 'trustservicemgr', 'trustnet',
-                     'udev-vnic-add@', 'udev-vnic-remove@'):
+        for unit in ('trustdservice', 'trustservice', 'trustservicemgr', 'trustnet'):
             content = overlay_text(f'trustagent/rootfs/etc/systemd/system/{unit}.service')
             self.assertIn('NoNewPrivileges=true', content, unit)
+        for rel in (
+            'trustagent/rootfs/etc/systemd/system/trustdservice.service',
+            'trustagent/rootfs/etc/systemd/system/trustservice.service',
+            'trustagent/rootfs/etc/systemd/system/trustservicemgr.service',
+            'trustagent/rootfs/etc/systemd/system/trustnet.service',
+            'sangfor/common/rootfs/etc/systemd/system/zt-sangfor-daemon.service',
+            'sangfor/atrust/rootfs/etc/systemd/system/aTrustDaemon.service.d/zt.conf',
+            'sangfor/atrust/rootfs/etc/systemd/system/eaio_service.service.d/zt.conf',
+            'sangfor/easyconnect/rootfs/etc/systemd/system/EasyMonitor.service.d/zt.conf',
+        ):
+            content = overlay_text(rel)
+            self.assertIn('Requires=zt-net.service', content, rel)
+            self.assertIn(
+                'CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_PTRACE',
+                content,
+                rel,
+            )
+            self.assertNotIn(' ~CAP_', content, rel)
+        for name, item in (('base', spec.BASE), *spec.CLIENTS.items()):
+            df = build.overlay_for(item)['Dockerfile'][0].decode('utf-8')
+            self.assertNotIn('# syntax=docker/dockerfile:1', df, name)
+        limits_conf = overlay_text('base/rootfs/etc/systemd/system.conf.d/99-zt-limits.conf')
+        self.assertIn('DefaultLimitNOFILE=1024:65536', limits_conf)
+        self.assertIn('DefaultLimitCORE=0', limits_conf)
 
     def test_network_policy_uses_dedicated_chain_and_filters_udp(self):
         unit = overlay_text('common/rootfs/etc/systemd/system/zt-net.service')
         self.assertIn('PassEnvironment=ZT_NET_MODE', unit)
         script = overlay_text('common/rootfs/usr/local/bin/zt-net-setup.sh')
-        self.assertIn('ZT-INPUT', script)
-        self.assertIn('-I INPUT 1 -j ZT-INPUT', script)
-        self.assertIn('zt: host only udp', script)
-        self.assertIn('zt: tunnel udp', script)
+        for token in (
+            'ZT-INPUT', 'ZT-OUTPUT', 'ZT-PREROUTING', 'ZT-POSTROUTING',
+            'zt: loopback guard', 'zt: host only udp', 'zt: tunnel udp',
+            'zt: kasmvnc out', 'zt: kasmvnc mark',
+            '--clamp-mss-to-pmtu', '--set-mss 1340', '--set-mss 1220',
+            '/run/zt/wan.env', '--reapply',
+        ):
+            self.assertIn(token, script, token)
+        ipt = overlay_text('common/rootfs/usr/local/sbin/zt-iptables')
+        self.assertIn('/usr/local/lib/zt-ipt', ipt)
+        self.assertIn('ZT_IPT_INTERNAL', ipt)
+        self.assertIn('--reapply', ipt)
+        self.assertIn('precedence ::ffff:0:0/96', overlay_text('base/rootfs/etc/gai.conf'))
+        hook = overlay_text('sangfor/atrust/rootfs/usr/sbin/sysctl-hook')
+        self.assertIn('utun[0-9]*.route_localnet=1', hook)
+        ta_routes = overlay_text('trustagent/rootfs/usr/local/bin/zt-trustagent-routes.sh')
+        self.assertNotIn('--set-mss', ta_routes)
+        self.assertIn('/run/zt/wan.env', ta_routes)
+
+    def test_zt_identity_generates_valid_deterministic_smbios3_and_dmi_id(self):
+        identity_script = ROOT / 'overlay/common/rootfs/usr/local/bin/zt-identity'
+        with tempfile.TemporaryDirectory() as tmp1, tempfile.TemporaryDirectory() as tmp2, \
+                tempfile.TemporaryDirectory() as tmp3:
+            for dest, seed in ((tmp1, 'machine-a'), (tmp2, 'machine-a'), (tmp3, 'machine-b')):
+                subprocess.run(
+                    [sys.executable, str(identity_script), '--dump-dir', dest, '--seed', seed],
+                    check=True, capture_output=True, text=True,
+                )
+            for bad_seed in ('', 'uninitialized', '  UNINITIALIZED  '):
+                bad = subprocess.run(
+                    [sys.executable, str(identity_script), '--dump-dir', tmp1, '--seed', bad_seed],
+                    check=False, capture_output=True, text=True,
+                )
+                self.assertEqual(bad.returncode, 2, bad_seed)
+
+            ep1 = (Path(tmp1) / 'dmi/tables/smbios_entry_point').read_bytes()
+            dmi1 = (Path(tmp1) / 'dmi/tables/DMI').read_bytes()
+            ep2 = (Path(tmp2) / 'dmi/tables/smbios_entry_point').read_bytes()
+            dmi2 = (Path(tmp2) / 'dmi/tables/DMI').read_bytes()
+            dmi3 = (Path(tmp3) / 'dmi/tables/DMI').read_bytes()
+
+            self.assertEqual((ep1, dmi1), (ep2, dmi2))
+            self.assertNotEqual(dmi1, dmi3)
+            self.assertEqual(len(ep1), 24)
+            self.assertEqual(ep1[:5], b'_SM3_')
+            self.assertEqual(sum(ep1) & 0xFF, 0)
+            self.assertEqual((ep1[6], ep1[7], ep1[8], ep1[10]), (24, 3, 0, 1))
+            max_size, table_addr = struct.unpack_from('<IQ', ep1, 12)
+            self.assertEqual(max_size, len(dmi1))
+            self.assertEqual(table_addr, 0)
+
+            # Walk every SMBIOS structure and confirm Type 0, 1, 2, 3, 4 (Processor), 127.
+            pos = 0
+            found = []
+            while pos < len(dmi1):
+                stype, slen, _handle = struct.unpack_from('<BBH', dmi1, pos)
+                found.append((stype, slen))
+                str_end = dmi1.index(b'\x00\x00', pos + slen)
+                pos = str_end + 2
+            self.assertEqual(pos, len(dmi1))
+            self.assertEqual(found, [(0, 18), (1, 27), (2, 15), (3, 21), (4, 48), (127, 4)])
+
+            # Confirm sysfs DMI id files are deterministic, 0444, and match SMBIOS serials.
+            serial1 = (Path(tmp1) / 'dmi/id/product_serial').read_text(encoding='ascii').strip()
+            serial2 = (Path(tmp2) / 'dmi/id/product_serial').read_text(encoding='ascii').strip()
+            serial3 = (Path(tmp3) / 'dmi/id/product_serial').read_text(encoding='ascii').strip()
+            uuid1 = (Path(tmp1) / 'dmi/id/product_uuid').read_text(encoding='ascii').strip()
+            self.assertEqual(serial1, serial2)
+            self.assertNotEqual(serial1, serial3)
+            self.assertTrue(serial1.startswith('ZT-'))
+            self.assertIn(serial1.encode('ascii'), dmi1)
+            self.assertRegex(uuid1, r'^[0-9a-f-]{36}$')
+            if os.name != 'nt':
+                self.assertEqual((Path(tmp1) / 'dmi/id/product_serial').stat().st_mode & 0o777, 0o444)
+                self.assertEqual((Path(tmp1) / 'dmi/tables/DMI').stat().st_mode & 0o777, 0o444)
 
 
 class TheZipapp(unittest.TestCase):
@@ -663,10 +939,10 @@ class GuestVerifier(unittest.TestCase):
         sample = (
             'ActiveState=active\n'
             'User=root\n'
-            'FragmentPath=/etc/systemd/system/zt-sangfor.service\n'
-            'DropInPaths=/etc/systemd/system/zt-sangfor.service.d/zt.conf\n'
+            'FragmentPath=/etc/systemd/system/zt-sangfor-daemon.service\n'
+            'DropInPaths=/etc/systemd/system/zt-sangfor-daemon.service.d/zt.conf\n'
             'ExecStartPre={ path=/usr/bin/setpriv ; argv[]=/usr/bin/setpriv ... }\n'
-            'ExecStart={ path=/usr/local/bin/zt-sangfor-session.sh ; argv[]=... }\n'
+            'ExecStart={ path=/usr/local/bin/zt-sangfor-daemon.sh ; argv[]=... }\n'
             '\n'
             'ActiveState=inactive\n'
             'User=\n'
@@ -674,16 +950,16 @@ class GuestVerifier(unittest.TestCase):
             'ExecStart={ path=/etc/rc.local ; argv[]=/etc/rc.local start }\n'
             '\n'
             'ActiveState=active\n'
-            'User=nobody\n'
-            'FragmentPath=/etc/systemd/system/zt-socks.service\n'
-            'ExecStart={ path=/usr/bin/microsocks ; argv[]=... }\n'
+            'User=kasm-user\n'
+            'FragmentPath=/etc/systemd/system/zt-sangfor-ui.service\n'
+            'ExecStart={ path=/usr/local/bin/zt-sangfor-ui.sh ; argv[]=... }\n'
         )
         units, active_execs, optional_execs = guest_check.parse_systemd_exec_paths(sample)
-        self.assertIn('/etc/systemd/system/zt-sangfor.service', units)
-        self.assertIn('/etc/systemd/system/zt-sangfor.service.d/zt.conf', units)
-        self.assertIn('/usr/local/bin/zt-sangfor-session.sh', active_execs)
+        self.assertIn('/etc/systemd/system/zt-sangfor-daemon.service', units)
+        self.assertIn('/etc/systemd/system/zt-sangfor-daemon.service.d/zt.conf', units)
+        self.assertIn('/usr/local/bin/zt-sangfor-daemon.sh', active_execs)
         self.assertIn('/etc/rc.local', optional_execs)
-        self.assertNotIn('/usr/bin/microsocks', active_execs)
+        self.assertNotIn('/usr/local/bin/zt-sangfor-ui.sh', active_execs)
 
     def test_parse_report_strict_json_validation(self):
         complete_map = {c: {'ok': True, 'detail': ''} for c in spec.CHECKS}
@@ -696,114 +972,836 @@ class GuestVerifier(unittest.TestCase):
         self.assertEqual(findings[-1][:2], ('inside', 'fail'))
         self.assertIn('ownership', findings[-1][2])
 
+    def test_check_log_checks_extra_logs_and_device_mid(self):
+        payload_box = [
+            b'({"jsonrpc":"2.0","method":"get_mid","result":"'
+            + b'A' * 64
+            + b'","uuid":"11111111-2222-4333-8444-555555555555"});'
+        ]
+
+        class MidHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(payload_box[0])
+
+            def log_message(self, *_args):
+                pass
+
+        srv = http.server.HTTPServer(('127.0.0.1', 0), MidHandler)
+        port = srv.server_address[1]
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f'http://127.0.0.1:{port}/_zerotrust/agent?method=get_mid'
+            with tempfile.TemporaryDirectory() as tmp:
+                ui_log = Path(tmp) / 'ui.log'
+                tds_log = Path(tmp) / 'trustdservice.log'
+                ui_log.write_text('started ok\n', encoding='utf-8')
+                tds_log.write_text('before encode mid_json:{"data":[{"id":"abc"}]}\n', encoding='utf-8')
+
+                ok, detail = guest_check.check_log(
+                    str(ui_log), ('Driver not loaded',),
+                    extra_logs=((str(tds_log), ('GetBaseDmiInfo failed', '"uuid":""')),),
+                    mid_url=url,
+                )
+                self.assertTrue(ok, detail)
+
+                payload_box[0] = b'({"jsonrpc":"2.0","method":"get_mid","result":"' + b'A' * 64 + b'","uuid":""});'
+                ok, detail = guest_check.check_log(
+                    str(ui_log), ('Driver not loaded',),
+                    extra_logs=((str(tds_log), ('GetBaseDmiInfo failed', '"uuid":""')),),
+                    mid_url=url,
+                )
+                self.assertFalse(ok)
+                self.assertIn('empty device uuid', detail)
+
+                payload_box[0] = (
+                    b'({"jsonrpc":"2.0","method":"get_mid","result":"'
+                    + b'A' * 64
+                    + b'","uuid":"11111111-2222-4333-8444-555555555555"});'
+                )
+                tds_log.write_text('ERROR|get mid GetBaseDmiInfo failed\n', encoding='utf-8')
+                ok, detail = guest_check.check_log(
+                    str(ui_log), ('Driver not loaded',),
+                    extra_logs=((str(tds_log), ('GetBaseDmiInfo failed', '"uuid":""')),),
+                    mid_url=url,
+                )
+                self.assertFalse(ok)
+                self.assertIn('GetBaseDmiInfo failed', detail)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_resolve_proc_exe_handles_qemu_binfmt_and_rosetta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'rootfs'
+            guest_bin = root / 'usr/bin/trustdservice'
+            guest_bin.parent.mkdir(parents=True)
+            guest_bin.write_bytes(b'\x7fELF')
+
+            # Linux QEMU binfmt_misc: /proc/<pid>/exe -> missing host /usr/bin/qemu-x86_64-static
+            p_qemu = Path(tmp) / 'proc_qemu'
+            p_qemu.mkdir()
+            (p_qemu / 'exe').symlink_to('/usr/bin/qemu-x86_64-static')
+            (p_qemu / 'cmdline').write_bytes(b'/usr/bin/trustdservice\x00--nofork\x00')
+            self.assertEqual(
+                guest_check._resolve_proc_exe(str(p_qemu), root=str(root)),
+                '/usr/bin/trustdservice',
+            )
+
+            # Rosetta on macOS Apple Container: skipped cleanly.
+            p_rosetta = Path(tmp) / 'proc_rosetta'
+            p_rosetta.mkdir()
+            (p_rosetta / 'exe').symlink_to('/run/rosetta/rosetta')
+            self.assertIsNone(guest_check._resolve_proc_exe(str(p_rosetta), root=str(root)))
+
+            # Native root binary: returned verbatim.
+            p_native = Path(tmp) / 'proc_native'
+            p_native.mkdir()
+            (p_native / 'exe').symlink_to('/usr/bin/trustdservice')
+            self.assertEqual(
+                guest_check._resolve_proc_exe(str(p_native), root=str(root)),
+                '/usr/bin/trustdservice',
+            )
+
+    def test_check_identity_and_limits_parsers(self):
+        identity_script = ROOT / 'overlay/common/rootfs/usr/local/bin/zt-identity'
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            mid_file = base / 'machine-id'
+            dbus_dir = base / 'dbus'
+            dbus_dir.mkdir()
+            dbus_mid = dbus_dir / 'machine-id'
+            seed = '0123456789abcdef0123456789abcdef'
+            mid_file.write_text(seed + '\n', encoding='utf-8')
+            dbus_mid.symlink_to(mid_file)
+            fw = base / 'firmware'
+            subprocess.run(
+                [sys.executable, str(identity_script), '--dump-dir', str(fw), '--seed', seed],
+                check=True, capture_output=True, text=True,
+            )
+            ok, detail = guest_check.check_identity(
+                machine_id_path=str(mid_file),
+                dbus_machine_id_path=str(dbus_mid),
+                firmware_dir=str(fw),
+                dmi_id_dir=str(fw / 'dmi/id'),
+                check_ro=False,
+            )
+            self.assertTrue(ok, detail)
+
+            mid_file.write_text('uninitialized\n', encoding='utf-8')
+            ok, detail = guest_check.check_identity(
+                machine_id_path=str(mid_file),
+                dbus_machine_id_path=str(dbus_mid),
+                firmware_dir=str(fw),
+                dmi_id_dir=str(fw / 'dmi/id'),
+                check_ro=False,
+            )
+            self.assertFalse(ok)
+            self.assertIn('invalid', detail)
+
+        sample_limits = (
+            'Limit                     Soft Limit           Hard Limit           Units\n'
+            'Max core file size        0                    0                    bytes\n'
+            'Max open files            1024                 65536                files\n'
+        )
+        parsed = guest_check._parse_proc_limits(sample_limits)
+        self.assertEqual(parsed['Max open files'], (1024, 65536))
+        self.assertEqual(parsed['Max core file size'], (0, 0))
+        self.assertEqual(guest_check._parse_cap_bnd('Uid:\t0\nCapBnd:\t0000000000003c00\n'), 0x3c00)
+        self.assertEqual(guest_check._parse_cap_bnd('CapBnd:\t0000000000200000\n') & (1 << 21), 1 << 21)
+
+
+_TUN_BENCHMARK_NET = ipaddress.ip_network('198.18.0.0/15')
+
+
+def _find_reachable_non_loopback_ipv4():
+    """Return a local non-loopback IPv4 reachable via TCP+UDP from this host, or None."""
+    candidates = []
+    for probe_dst in (('10.255.255.1', 80), ('192.168.255.1', 80), ('172.16.255.1', 80)):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect(probe_dst)
+                cand = probe.getsockname()[0]
+            if cand not in candidates:
+                candidates.append(cand)
+        except OSError:
+            continue
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            cand = info[4][0]
+            if cand not in candidates:
+                candidates.append(cand)
+    except OSError:
+        pass
+
+    for cand in candidates:
+        try:
+            ip = ipaddress.ip_address(cand)
+            if ip.is_loopback or ip.is_unspecified or ip.is_link_local or ip in _TUN_BENCHMARK_NET:
+                continue
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+                srv.settimeout(0.3)
+                srv.bind((cand, 0))
+                srv.listen(1)
+                port = srv.getsockname()[1]
+                accepted = []
+
+                def _accept_one():
+                    try:
+                        conn, _ = srv.accept()
+                        conn.close()
+                        accepted.append(True)
+                    except OSError:
+                        pass
+
+                t = threading.Thread(target=_accept_one, daemon=True)
+                t.start()
+                with socket.create_connection((cand, port), timeout=0.3):
+                    pass
+                t.join(timeout=0.5)
+                if not accepted:
+                    continue
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u1, \
+                    socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u2:
+                u1.settimeout(0.3)
+                u1.bind((cand, 0))
+                u2.sendto(b'p', (cand, u1.getsockname()[1]))
+                if u1.recvfrom(16)[0] != b'p':
+                    continue
+            return cand
+        except OSError:
+            continue
+    return None
+
+
+def _mux_subprocess_source(allow_loopback_for_sandbox=False):
+    src = resources.guest_script('mux')
+    if not allow_loopback_for_sandbox:
+        return src
+    return src.replace(
+        'def is_disallowed_target_ip(host):',
+        'def is_disallowed_target_ip(host):\n    return False\ndef _orig_is_disallowed_target_ip(host):',
+        1,
+    )
+
+
+async def _socks5_connect(proxy_port, dst_host, dst_port, auth=None, domain=False):
+    """Open a SOCKS5 CONNECT through proxy_port; return (reader, writer, rep, bnd_ip, bnd_port)."""
+    r, w = await asyncio.open_connection('127.0.0.1', proxy_port)
+    if auth is None:
+        w.write(b'\x05\x01\x00')
+        await w.drain()
+        assert await r.readexactly(2) == b'\x05\x00'
+    else:
+        u, p = auth[0].encode('utf-8'), auth[1].encode('utf-8')
+        w.write(b'\x05\x01\x02')
+        await w.drain()
+        assert await r.readexactly(2) == b'\x05\x02'
+        w.write(bytes([0x01, len(u)]) + u + bytes([len(p)]) + p)
+        await w.drain()
+        assert await r.readexactly(2) == b'\x01\x00'
+    if domain:
+        raw_dom = dst_host.encode('ascii')
+        addr_bytes = bytes([guest_mux.ATYP_DOMAIN, len(raw_dom)]) + raw_dom + struct.pack('!H', dst_port)
+    else:
+        addr_bytes = guest_mux.encode_socks_addr(dst_host, dst_port)
+    w.write(b'\x05\x01\x00' + addr_bytes)
+    await w.drain()
+    hdr = await r.readexactly(4)
+    assert hdr[0] == 0x05 and hdr[2] == 0x00, hdr
+    rep, atyp = hdr[1], hdr[3]
+    if atyp == 1:
+        raw = await r.readexactly(6)
+        bnd_ip = socket.inet_ntop(socket.AF_INET, raw[:4])
+        bnd_port = (raw[4] << 8) | raw[5]
+    elif atyp == 4:
+        raw = await r.readexactly(18)
+        bnd_ip = socket.inet_ntop(socket.AF_INET6, raw[:16])
+        bnd_port = (raw[16] << 8) | raw[17]
+    else:
+        dlen = (await r.readexactly(1))[0]
+        raw = await r.readexactly(dlen + 2)
+        bnd_ip = raw[:-2].decode('ascii', errors='replace')
+        bnd_port = (raw[-2] << 8) | raw[-1]
+    return r, w, rep, bnd_ip, bnd_port
+
 
 class MultiplexedBridge(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'guest/mux.py stdio pipes run inside Linux containers')
     def test_host_and_guest_mux_handle_concurrent_streams_and_rfc1929_auth(self):
         async def scenario():
+            target_ip = _find_reachable_non_loopback_ipv4()
+            sandbox_fallback = target_ip is None
+            bind_ip = target_ip or '127.0.0.1'
+            mux_code = _mux_subprocess_source(allow_loopback_for_sandbox=sandbox_fallback)
             backend_hits = 0
 
-            async def fake_microsocks(reader, writer):
+            async def echo_target(reader, writer):
                 nonlocal backend_hits
                 backend_hits += 1
                 try:
-                    greet = await reader.readexactly(3)
-                    if greet != b'\x05\x01\x00':
-                        return
-                    writer.write(b'\x05\x00')
-                    await writer.drain()
                     while data := await reader.read(4096):
                         writer.write(b'ok:' + data)
                         await writer.drain()
-                except asyncio.IncompleteReadError:
+                except (ConnectionError, OSError):
                     pass
                 finally:
                     writer.close()
-                    await writer.wait_closed()
+                    with contextlib.suppress(ConnectionError, OSError):
+                        await writer.wait_closed()
 
-            backend = await asyncio.start_server(fake_microsocks, '127.0.0.1', 0)
+            backend = await asyncio.start_server(echo_target, bind_ip, 0)
             backend_port = backend.sockets[0].getsockname()[1]
 
             class LocalMuxTunnel(bridge.HostMuxTunnel):
-                def __init__(self, auth=None):
-                    super().__init__(engine.AppleContainerEngine(), 'zt-test', auth=auth)
+                def __init__(self, auth=None, health_path=None):
+                    super().__init__(
+                        engine.AppleContainerEngine(), 'zt-test', auth=auth,
+                        mux_source=mux_code, profile='trustagent', health_path=health_path,
+                    )
                     self.spawns = 0
 
                 async def _spawn_process(self):
                     self.spawns += 1
                     return await asyncio.create_subprocess_exec(
-                        sys.executable, '-c', resources.guest_script('mux'),
-                        '127.0.0.1', str(backend_port),
+                        sys.executable, '-c', self._mux_source,
+                        '--profile', 'trustagent',
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
 
-            tunnel = LocalMuxTunnel(auth=('kasm_user', 's3cret'))
-            frontend = await asyncio.start_server(tunnel.handle_client, '127.0.0.1', 0)
-            frontend_port = frontend.sockets[0].getsockname()[1]
+            with tempfile.TemporaryDirectory() as tmp:
+                health_path = Path(tmp) / 'health.json'
+                tunnel = LocalMuxTunnel(auth=('kasm_user', 's3cret'), health_path=health_path)
+                frontend = await asyncio.start_server(tunnel.handle_client, '127.0.0.1', 0)
+                frontend_port = frontend.sockets[0].getsockname()[1]
 
-            try:
-                # 1. No-auth greeting rejected without touching backend
-                r, w = await asyncio.open_connection('127.0.0.1', frontend_port)
-                w.write(b'\x05\x01\x00')
-                await w.drain()
-                self.assertEqual(await r.readexactly(2), b'\x05\xff')
-                w.close()
-                await w.wait_closed()
-                self.assertEqual(backend_hits, 0)
+                try:
+                    # 1. No-auth greeting rejected without touching backend
+                    r, w = await asyncio.open_connection('127.0.0.1', frontend_port)
+                    w.write(b'\x05\x01\x00')
+                    await w.drain()
+                    self.assertEqual(await r.readexactly(2), b'\x05\xff')
+                    w.close()
+                    await w.wait_closed()
+                    self.assertEqual(backend_hits, 0)
 
-                # 2. Wrong password rejected without touching backend
-                r, w = await asyncio.open_connection('127.0.0.1', frontend_port)
-                w.write(b'\x05\x01\x02')
-                await w.drain()
-                self.assertEqual(await r.readexactly(2), b'\x05\x02')
-                w.write(b'\x01\x09kasm_user\x06wrong1')
-                await w.drain()
-                self.assertEqual(await r.readexactly(2), b'\x01\x01')
-                w.close()
-                await w.wait_closed()
-                self.assertEqual(backend_hits, 0)
+                    # 2. Wrong password rejected without touching backend
+                    r, w = await asyncio.open_connection('127.0.0.1', frontend_port)
+                    w.write(b'\x05\x01\x02')
+                    await w.drain()
+                    self.assertEqual(await r.readexactly(2), b'\x05\x02')
+                    w.write(b'\x01\x09kasm_user\x06wrong1')
+                    await w.drain()
+                    self.assertEqual(await r.readexactly(2), b'\x01\x01')
+                    w.close()
+                    await w.wait_closed()
+                    self.assertEqual(backend_hits, 0)
 
-                # 3. 10 concurrent authenticated streams share 1 mux process
-                async def authed_client(idx):
-                    cr, cw = await asyncio.open_connection('127.0.0.1', frontend_port)
-                    cw.write(b'\x05\x01\x02')
-                    await cw.drain()
-                    assert await cr.readexactly(2) == b'\x05\x02'
-                    cw.write(b'\x01\x09kasm_user\x06s3cret')
-                    await cw.drain()
-                    assert await cr.readexactly(2) == b'\x01\x00'
-                    payload = f'req-{idx}'.encode() * 20
-                    cw.write(payload)
-                    cw.write_eof()
-                    await cw.drain()
-                    reply = await cr.read()
-                    cw.close()
-                    await cw.wait_closed()
-                    return reply, b'ok:' + payload
+                    # 3. 10 concurrent authenticated native SOCKS5 CONNECT streams share 1 GuestMux
+                    async def authed_client(idx):
+                        cr, cw, rep, _, _ = await _socks5_connect(
+                            frontend_port, bind_ip, backend_port, auth=('kasm_user', 's3cret'),
+                        )
+                        self.assertEqual(rep, 0x00)
+                        payload = f'req-{idx}'.encode() * 20
+                        cw.write(payload)
+                        cw.write_eof()
+                        await cw.drain()
+                        reply = await cr.read()
+                        cw.close()
+                        await cw.wait_closed()
+                        return reply, b'ok:' + payload
 
-                results = await asyncio.gather(*(authed_client(i) for i in range(10)))
-                for got, want in results:
-                    self.assertEqual(got, want)
-                self.assertEqual(tunnel.spawns, 1)
-                self.assertEqual(backend_hits, 10)
+                    results = await asyncio.gather(*(authed_client(i) for i in range(10)))
+                    for got, want in results:
+                        self.assertEqual(got, want)
+                    self.assertEqual(tunnel.spawns, 1)
+                    self.assertEqual(backend_hits, 10)
+                    self.assertTrue(health_path.is_file())
+                    snap = json.loads(health_path.read_text(encoding='utf-8'))
+                    self.assertIn('vpn', snap)
+                    self.assertIn('updated_at', snap)
 
-                loop = asyncio.get_running_loop()
-                self.assertFalse(await loop.run_in_executor(None, bridge.socks_ready, frontend_port, None))
-                self.assertTrue(
-                    await loop.run_in_executor(
-                        None, bridge.socks_ready, frontend_port, ('kasm_user', 's3cret'),
+                    loop = asyncio.get_running_loop()
+                    self.assertFalse(await loop.run_in_executor(None, bridge.socks_ready, frontend_port, None))
+                    self.assertTrue(
+                        await loop.run_in_executor(
+                            None, bridge.socks_ready, frontend_port, ('kasm_user', 's3cret'),
+                        )
                     )
-                )
-            finally:
-                frontend.close()
-                await frontend.wait_closed()
-                await tunnel.close()
-                backend.close()
-                await backend.wait_closed()
+                finally:
+                    frontend.close()
+                    await frontend.wait_closed()
+                    await tunnel.close()
+                    backend.close()
+                    await backend.wait_closed()
 
         asyncio.run(scenario())
+
+    @unittest.skipIf(os.name == 'nt', 'guest/mux.py stdio pipes run inside Linux containers')
+    def test_guest_mux_v3_blocks_loopback_ssrf_post_resolve_and_supports_happy_eyeballs(self):
+        # 1. Pure IP classification matrix
+        for blocked in ('127.0.0.1', '127.255.255.254', '0.0.0.0', '::1', '::', '::ffff:127.0.0.1', '::ffff:0.0.0.0'):
+            self.assertTrue(guest_mux.is_disallowed_target_ip(blocked), blocked)
+        for allowed in ('10.0.0.1', '172.16.0.2', '192.168.1.10', '8.8.8.8', '2001:db8::1', 'fd00::1'):
+            self.assertFalse(guest_mux.is_disallowed_target_ip(allowed), allowed)
+
+        async def scenario():
+            # 2. Unmodified GuestMux subprocess MUST reject loopback/unspecified/DNS-rebinding targets (REP=0x02)
+            #    and reject disallowed CALLBACK_OPEN ports (REP=0x02), plus MAX_TCP_STREAMS cap.
+            class RealUnmodifiedMuxTunnel(bridge.HostMuxTunnel):
+                async def _spawn_process(self):
+                    return await asyncio.create_subprocess_exec(
+                        sys.executable, '-c', resources.guest_script('mux'),
+                        '--profile', 'trustagent', '--callback-ports', '39301,6901',
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tunnel = RealUnmodifiedMuxTunnel(
+                    engine.AppleContainerEngine(), 'zt-ssrf', auth=None,
+                    profile='trustagent', health_path=Path(tmp) / 'h.json',
+                )
+                srv = await asyncio.start_server(tunnel.handle_client, '127.0.0.1', 0)
+                port = srv.sockets[0].getsockname()[1]
+                try:
+                    proc = await tunnel.ensure_connected()
+                    for dst_host, dst_port, is_dom in (
+                        ('127.0.0.1', 6901, False),
+                        ('0.0.0.0', 6901, False),
+                        ('::1', 6901, False),
+                        ('::ffff:127.0.0.1', 6901, False),
+                        ('localhost', 6901, True),
+                    ):
+                        _, w, rep, _, _ = await _socks5_connect(port, dst_host, dst_port, domain=is_dom)
+                        w.close()
+                        await w.wait_closed()
+                        self.assertEqual(rep, guest_mux.REP_NOT_ALLOWED, (dst_host, dst_port, is_dom))
+
+                    # Disallowed CALLBACK_OPEN port (6901 stripped even though passed in CLI, 54631 not for trustagent)
+                    for bad_cb in (6901, 54631):
+                        sid = tunnel._alloc_id()
+                        fut = asyncio.get_running_loop().create_future()
+                        tunnel._pending_opens[sid] = fut
+                        await tunnel.send_on(proc, sid, guest_mux.CALLBACK_OPEN, guest_mux.PORT_STRUCT.pack(bad_cb))
+                        kind, payload = await asyncio.wait_for(fut, timeout=5.0)
+                        tunnel._pending_opens.pop(sid, None)
+                        self.assertEqual((kind, payload), (guest_mux.OPEN_ERR, bytes([guest_mux.REP_NOT_ALLOWED])))
+
+                    # MAX_TCP_STREAMS cap returns REP_GENERAL_FAILURE immediately
+                    tunnel._max_tcp_streams = 0
+                    _, w, rep, _, _ = await _socks5_connect(port, '10.0.0.1', 443)
+                    w.close()
+                    await w.wait_closed()
+                    self.assertEqual(rep, guest_mux.REP_GENERAL_FAILURE)
+                finally:
+                    srv.close()
+                    await srv.wait_closed()
+                    await tunnel.close()
+
+            # 3. RFC 8305 Happy Eyeballs falls back when first candidate fails/stalls
+            mux = guest_mux.GuestMux(profile='trustagent')
+            try:
+                # Address ordering interleaves IPv4 first then IPv6 for enterprise VPN tunnels
+                interleaved = guest_mux._interleave_v4_first([
+                    (socket.AF_INET6, '2001:db8::1'),
+                    (socket.AF_INET6, '2001:db8::2'),
+                    (socket.AF_INET, '198.51.100.1'),
+                ])
+                self.assertEqual(
+                    list(interleaved),
+                    [
+                        (socket.AF_INET, '198.51.100.1'),
+                        (socket.AF_INET6, '2001:db8::1'),
+                        (socket.AF_INET6, '2001:db8::2'),
+                    ],
+                )
+
+                # DNS rebinding check: resolve_and_filter rejects if all resolved IPs are loopback
+                with mock.patch.object(
+                    guest_mux.socket, 'getaddrinfo',
+                    return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', 80))],
+                ):
+                    status, targets = await mux.resolve_and_filter('rebind.example', 80, socket.SOCK_STREAM)
+                self.assertEqual((status, tuple(targets)), ('blocked', ()))
+
+                # Happy Eyeballs opens second candidate when first raises ConnectionRefusedError
+                fake_reader, fake_writer = mock.Mock(), mock.Mock()
+                calls = []
+
+                async def fake_open(host, port, family=0):
+                    calls.append(host)
+                    if host == '198.51.100.1':
+                        raise ConnectionRefusedError('refused')
+                    return fake_reader, fake_writer
+
+                with mock.patch.object(guest_mux.asyncio, 'open_connection', side_effect=fake_open):
+                    got = await mux._happy_eyeballs_connect(
+                        [(socket.AF_INET, '198.51.100.1'), (socket.AF_INET, '198.51.100.2')],
+                        443,
+                    )
+                self.assertEqual(got, (fake_reader, fake_writer))
+                self.assertEqual(calls, ['198.51.100.1', '198.51.100.2'])
+            finally:
+                mux._dns_executor.shutdown(wait=False)
+
+        asyncio.run(scenario())
+
+        # 4. verify.mux_e2e_holds runs end-to-end against a stand-in TCP echo listener
+        target_ip = _find_reachable_non_loopback_ipv4()
+        if target_ip:
+            srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv_sock.bind((target_ip, 0))
+            srv_sock.listen(8)
+            standin_port = srv_sock.getsockname()[1]
+            stop_evt = threading.Event()
+
+            def serve_echo():
+                srv_sock.settimeout(0.2)
+                while not stop_evt.is_set():
+                    try:
+                        conn, _ = srv_sock.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    try:
+                        data = conn.recv(64)
+                        if data:
+                            conn.sendall(b'echo:' + data)
+                    finally:
+                        conn.close()
+
+            th = threading.Thread(target=serve_echo, daemon=True)
+            th.start()
+            try:
+                fake_eng = mock.Mock(cli='docker')
+                fake_eng.inspect.return_value = {
+                    'status': {'networks': [{'ipv4Address': f'{target_ip}/24'}]}
+                }
+
+                class TestE2ETunnel(bridge.HostMuxTunnel):
+                    async def _spawn_process(self):
+                        return await asyncio.create_subprocess_exec(
+                            sys.executable, '-c', resources.guest_script('mux'),
+                            '--profile', 'trustagent', '--callback-ports', '39301',
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+
+                with mock.patch.object(verify, 'STAND_IN', standin_port):
+                    problem, detail = verify.mux_e2e_holds(
+                        fake_eng, 'zt-verify-trustagent', 'trustagent', tunnel_cls=TestE2ETunnel,
+                    )
+                self.assertIsNone(problem, problem)
+                self.assertIn('REP=0x02', detail)
+                self.assertIn(f'{target_ip}:{standin_port}', detail)
+            finally:
+                stop_evt.set()
+                srv_sock.close()
+                th.join(timeout=2)
+
+    @unittest.skipIf(os.name == 'nt', 'guest/mux.py stdio pipes run inside Linux containers')
+    def test_sso_events_callback_dual_allowlist_ttl_and_health_persistence(self):
+        async def scenario():
+            # Echo server simulating a VPN client's local SSO callback listener on 127.0.0.1.
+            async def cb_backend(reader, writer):
+                req = await reader.read(1024)
+                writer.write(b'CBOK:' + req)
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+
+            cb_srv = await asyncio.start_server(cb_backend, '127.0.0.1', 0)
+            cb_port = cb_srv.sockets[0].getsockname()[1]
+
+            # Find a separate free ephemeral port on 127.0.0.1 for the host callback listener
+            # (on the same machine host and guest share loopback, so pick a distinct port for host
+            # only by binding cb_srv on cb_port and letting HostMuxTunnel test forwarding via
+            # direct CALLBACK_OPEN, plus testing host listener lifecycle on another free port).
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(('127.0.0.1', 0))
+                host_cb_port = probe.getsockname()[1]
+
+            with tempfile.TemporaryDirectory() as tmp:
+                events_file = Path(tmp) / 'latest.json'
+                health_path = Path(tmp) / 'health-trustagent.json'
+                custom_mux = resources.guest_script('mux').replace(
+                    'STATIC_CALLBACK_ALLOWLIST = frozenset((39301, 54631, 54530))',
+                    f'STATIC_CALLBACK_ALLOWLIST = frozenset((39301, 54631, 54530, {cb_port}, {host_cb_port}))',
+                    1,
+                ).replace(
+                    "EVENTS_PATH = '/run/zt-events/latest.json'",
+                    f'EVENTS_PATH = {str(events_file)!r}',
+                    1,
+                )
+
+                class CallbackMuxTunnel(bridge.HostMuxTunnel):
+                    async def _spawn_process(self):
+                        return await asyncio.create_subprocess_exec(
+                            sys.executable, '-c', custom_mux,
+                            '--profile', 'trustagent', '--callback-ports', f'{cb_port},{host_cb_port}',
+                            stdin=asyncio.subprocess.PIPE,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+
+                with mock.patch.object(bridge, 'STATIC_CALLBACK_ALLOWLIST', frozenset((39301, 54631, 54530, cb_port, host_cb_port))):
+                    tunnel = CallbackMuxTunnel(
+                        engine.AppleContainerEngine(), 'zt-cb', auth=None,
+                        profile='trustagent',
+                        callback_ports=(host_cb_port,),
+                        callback_ttl=0.8,
+                        health_path=health_path,
+                    )
+                    try:
+                        proc = await tunnel.ensure_connected()
+
+                        # 1. Write OPEN_URL event (as safe xdg-open does) and trigger poll via PING.
+                        sso_url = 'https://sso.example.com/auth?code=abc'
+                        events_file.write_text(
+                            json.dumps({'kind': 'url', 'url': sso_url, 'ts': int(bridge.time.time())}) + '\n',
+                            encoding='utf-8',
+                        )
+                        await tunnel.ping(proc=proc)
+                        for _ in range(30):
+                            if host_cb_port in tunnel._callback_servers:
+                                break
+                            await asyncio.sleep(0.05)
+
+                        self.assertIn(host_cb_port, tunnel._callback_servers)
+                        # Listener MUST bind strictly on 127.0.0.1
+                        bound_addr = tunnel._callback_servers[host_cb_port].sockets[0].getsockname()
+                        self.assertEqual(bound_addr[0], '127.0.0.1')
+                        # health.json persisted with 0600, sso_url, vpn=sso-pending, callback_ports
+                        snap = json.loads(health_path.read_text(encoding='utf-8'))
+                        self.assertEqual(snap.get('sso_url'), sso_url)
+                        self.assertEqual(snap.get('vpn'), 'sso-pending')
+                        self.assertEqual(snap.get('callback_ports'), [host_cb_port])
+                        self.assertEqual(health_path.stat().st_mode & 0o777, 0o600)
+
+                        # 2. Direct CALLBACK_OPEN to allowlisted cb_port succeeds & splices data!
+                        sid = tunnel._alloc_id()
+                        st = guest_mux.StreamState()
+                        fut = asyncio.get_running_loop().create_future()
+                        tunnel._streams[sid] = st
+                        tunnel._pending_opens[sid] = fut
+                        await tunnel.send_on(proc, sid, guest_mux.CALLBACK_OPEN, guest_mux.PORT_STRUCT.pack(cb_port))
+                        kind, _ = await asyncio.wait_for(fut, timeout=5.0)
+                        self.assertEqual(kind, guest_mux.OPEN_OK)
+                        await tunnel.send_on(proc, sid, guest_mux.DATA, b'token=xyz')
+                        await tunnel.send_on(proc, sid, guest_mux.EOF)
+                        got_kind, got_data = await asyncio.wait_for(st.recv(), timeout=5.0)
+                        self.assertEqual((got_kind, got_data), (guest_mux.DATA, b'CBOK:token=xyz'))
+                        tunnel._streams.pop(sid, None)
+                        tunnel._pending_opens.pop(sid, None)
+
+                        # 3. TTL expiry automatically closes the host 127.0.0.1 callback listener!
+                        for _ in range(30):
+                            if not tunnel._callback_servers:
+                                break
+                            await asyncio.sleep(0.1)
+                        self.assertEqual(tunnel._callback_servers, {})
+                    finally:
+                        await tunnel.close()
+                        cb_srv.close()
+                        await cb_srv.wait_closed()
+
+        asyncio.run(scenario())
+
+    def test_accept_all_rate_limiters_and_sleep_wake_heartbeat(self):
+        # 1. _ConnRateLimiter: per-real-IP window limit, loopback exempt, bounded LRU
+        conn_lim = bridge._ConnRateLimiter(max_hits=3, window=10.0, max_ips=2)
+        for _ in range(10):
+            self.assertTrue(conn_lim.allow('127.0.0.1', now=100.0))
+            self.assertTrue(conn_lim.allow('::1', now=100.0))
+        self.assertTrue(conn_lim.allow('203.0.113.5', now=100.0))
+        self.assertTrue(conn_lim.allow('203.0.113.5', now=101.0))
+        self.assertTrue(conn_lim.allow('203.0.113.5', now=102.0))
+        self.assertFalse(conn_lim.allow('203.0.113.5', now=103.0))
+        # After window slides past 100.0, allowed again
+        self.assertTrue(conn_lim.allow('203.0.113.5', now=110.5))
+        # Bounded map size
+        conn_lim.allow('203.0.113.6', now=111.0)
+        conn_lim.allow('203.0.113.7', now=111.0)
+        self.assertLessEqual(len(conn_lim._hits), 2)
+
+        # 2. _AuthFailureLimiter: 5 failed RFC 1929 logins -> 60s block, loopback exempt, success clears
+        auth_lim = bridge._AuthFailureLimiter(max_failures=5, window=60.0, block_seconds=60.0)
+        for _ in range(10):
+            auth_lim.record_failure('127.0.0.1', now=10.0)
+        self.assertFalse(auth_lim.is_blocked('127.0.0.1', now=10.0))
+        for i in range(4):
+            auth_lim.record_failure('198.51.100.9', now=10.0 + i)
+            self.assertFalse(auth_lim.is_blocked('198.51.100.9', now=10.0 + i))
+        auth_lim.record_failure('198.51.100.9', now=15.0)
+        self.assertTrue(auth_lim.is_blocked('198.51.100.9', now=20.0))
+        self.assertFalse(auth_lim.is_blocked('198.51.100.9', now=76.0))
+        auth_lim.record_failure('198.51.100.9', now=80.0)
+        auth_lim.record_success('198.51.100.9')
+        self.assertNotIn('198.51.100.9', auth_lim._failures)
+
+        # 3. Sleep-wake detector & heartbeat PING failure triggers clean tunnel reset
+        self.assertFalse(bridge._check_sleep_jump(100.0, 1000.0, 101.0, 1001.0))
+        self.assertTrue(bridge._check_sleep_jump(100.0, 1000.0, 101.0, 1060.0))
+
+        async def hb_scenario():
+            tunnel = bridge.HostMuxTunnel(
+                engine.AppleContainerEngine(), 'zt-hb',
+                heartbeat_interval=0.05, heartbeat_timeout=0.05,
+            )
+            fake_proc = mock.Mock(returncode=None, stdin=None)
+            fake_proc.wait = mock.AsyncMock(return_value=0)
+            tunnel._process = fake_proc
+            resets = []
+
+            async def fake_reset(p):
+                resets.append(p)
+                tunnel._process = None
+
+            with mock.patch.object(bridge, '_check_sleep_jump', return_value=True), \
+                    mock.patch.object(tunnel, 'ping', side_effect=asyncio.TimeoutError), \
+                    mock.patch.object(tunnel, '_reset_tunnel', side_effect=fake_reset), \
+                    mock.patch.object(tunnel, 'ensure_connected', new=mock.AsyncMock()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                tunnel.start_heartbeat()
+                for _ in range(40):
+                    if resets:
+                        break
+                    await asyncio.sleep(0.02)
+                await tunnel.close()
+            self.assertEqual(resets, [fake_proc])
+
+        asyncio.run(hb_scenario())
+
+    def test_boot_health_fast_refresh_dual_stack_fallback_and_idle_tunnel_keepalive(self):
+        # 1. Fast post-start health refresh converges daemon-down -> connected before 15s cadence
+        async def boot_refresh_scenario():
+            tunnel = bridge.HostMuxTunnel(
+                engine.AppleContainerEngine(), 'zt-boot',
+                heartbeat_interval=15.0, heartbeat_timeout=1.0,
+                boot_refresh_delays=(0.06, 0.14),
+            )
+            fake_proc = mock.Mock(returncode=None, stdin=None)
+            fake_proc.wait = mock.AsyncMock(return_value=0)
+            tunnel._process = fake_proc
+            tunnel._epoch = 1
+            tunnel._connected_at = bridge.time.monotonic()
+            tunnel._last_health = {'vpn': 'daemon-down'}
+            ping_calls = []
+
+            async def fake_ping(proc=None, timeout=None):
+                ping_calls.append(proc)
+                if len(ping_calls) == 1:
+                    tunnel._last_health = {'vpn': 'disconnected'}
+                else:
+                    tunnel._last_health = {'vpn': 'connected', 'iface': 'vnic0'}
+                return tunnel._last_health
+
+            with mock.patch.object(tunnel, 'ping', side_effect=fake_ping):
+                tunnel.start_heartbeat()
+                for _ in range(40):
+                    if len(ping_calls) >= 2:
+                        break
+                    await asyncio.sleep(0.02)
+                await tunnel.close()
+            self.assertEqual(len(ping_calls), 2)
+            self.assertEqual(tunnel._last_health['vpn'], 'connected')
+
+        asyncio.run(boot_refresh_scenario())
+
+        # 2. Dual-stack listener gracefully falls back to IPv4 on IPv6 EAFNOSUPPORT without leaking sockets
+        async def dual_stack_fallback():
+            real_socket = bridge.socket.socket
+
+            def ipv4_only_socket(family=socket.AF_INET, *args, **kwargs):
+                if family == socket.AF_INET6:
+                    raise OSError(socket.errno.EAFNOSUPPORT, 'no ipv6')
+                return real_socket(family, *args, **kwargs)
+
+            async def noop(_r, _w):
+                pass
+
+            with mock.patch.object(bridge.socket, 'socket', side_effect=ipv4_only_socket):
+                servers = await bridge._start_dual_stack_servers(noop, '127.0.0.1', 0)
+            try:
+                self.assertEqual(len(servers), 1)
+            finally:
+                for srv in servers:
+                    srv.close()
+                    await srv.wait_closed()
+
+        asyncio.run(dual_stack_fallback())
+
+        # 3. _discover_keepalive_target prioritizes non-loopback resolv.conf DNS -> route gw -> subnet peer
+        with tempfile.TemporaryDirectory() as tmp:
+            resolv = Path(tmp) / 'resolv.conf'
+            route = Path(tmp) / 'route'
+            # Skip loopback 127.0.0.1, pick non-loopback corp DNS 10.10.0.53
+            resolv.write_text('nameserver 127.0.0.1\nnameserver 10.10.0.53\n', encoding='utf-8')
+            self.assertEqual(
+                guest_mux._discover_keepalive_target('vnic0', resolv_path=str(resolv), route_path=str(route)),
+                (socket.AF_INET, '10.10.0.53', 53),
+            )
+            # Loopback-only resolv.conf falls back to tunnel gateway in /proc/net/route
+            resolv.write_text('nameserver 127.0.0.1\n', encoding='utf-8')
+            # 10.8.0.1 in little-endian hex = 0100080A; 10.8.0.0/24 mask = 00FFFFFF
+            route.write_text(
+                'Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\n'
+                'vnic0\t0000080A\t0100080A\t0003\t0\t0\t0\t00FFFFFF\n',
+                encoding='utf-8',
+            )
+            self.assertEqual(
+                guest_mux._discover_keepalive_target('vnic0', resolv_path=str(resolv), route_path=str(route)),
+                (socket.AF_INET, '10.8.0.1', 53),
+            )
+            self.assertIsNone(guest_mux._discover_keepalive_target('', resolv_path=str(resolv), route_path=str(route)))
+
+        # 4. Passive idle tunnel keepalive: no-op when tunnel down, fires once per idle window when UP, resets on activity
+        async def keepalive_scenario():
+            probed = []
+
+            async def fake_probe(iface):
+                probed.append(iface)
+                return True
+
+            mux = guest_mux.GuestMux(
+                profile='trustagent', keepalive_idle=0.1, keepalive_probe_fn=fake_probe,
+            )
+            try:
+                # Tunnel down -> silent no-op even after idle window
+                with mock.patch.object(guest_mux, '_detect_tunnel_iface', return_value=''):
+                    mux._last_tunnel_activity = guest_mux.time.monotonic() - 1.0
+                    self.assertFalse(mux._maybe_idle_keepalive())
+                    self.assertEqual(probed, [])
+
+                # Tunnel UP + active traffic -> no-op
+                with mock.patch.object(guest_mux, '_detect_tunnel_iface', return_value='vnic0'), \
+                        mock.patch.object(guest_mux, '_read_iface_tx_bytes', return_value=100):
+                    mux.touch_tunnel_activity()
+                    self.assertFalse(mux._maybe_idle_keepalive())
+
+                    # Idle >= keepalive_idle -> triggers exactly 1 probe, rate-limited immediately after
+                    mux._last_tunnel_activity = guest_mux.time.monotonic() - 0.5
+                    self.assertTrue(mux._maybe_idle_keepalive())
+                    self.assertFalse(mux._maybe_idle_keepalive())
+                    if mux._bg_tasks:
+                        await asyncio.gather(*list(mux._bg_tasks), return_exceptions=True)
+                    self.assertEqual(probed, ['vnic0'])
+                    self.assertEqual(mux._keepalive_probes_sent, 1)
+            finally:
+                mux._dns_executor.shutdown(wait=False)
+
+        asyncio.run(keepalive_scenario())
 
     def test_lan_guard_peer_filter_and_tcp_splice(self):
         class FakeWriter:
@@ -1001,6 +1999,11 @@ class MultiplexedBridge(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'guest/mux.py stdio pipes run inside Linux containers')
     def test_stalled_tcp_client_never_blocks_new_handshakes_tcp_or_udp_and_resumes_cleanly(self):
         async def scenario():
+            target_ip = _find_reachable_non_loopback_ipv4()
+            sandbox_fallback = target_ip is None
+            bind_ip = target_ip or '127.0.0.1'
+            mux_code = _mux_subprocess_source(allow_loopback_for_sandbox=sandbox_fallback)
+
             big_size = 16 * 1024 * 1024  # 16 MiB (4x the 4 MiB per-stream window)
             block = bytes(range(256)) * 256  # 64 KiB deterministic block
             want_sha = hashlib.sha256()
@@ -1008,13 +2011,8 @@ class MultiplexedBridge(unittest.TestCase):
                 want_sha.update(block)
             want_digest = want_sha.hexdigest()
 
-            async def fake_microsocks(reader, writer):
+            async def target_server(reader, writer):
                 try:
-                    greet = await reader.readexactly(3)
-                    if greet != b'\x05\x01\x00':
-                        return
-                    writer.write(b'\x05\x00')
-                    await writer.drain()
                     cmd = await reader.readexactly(3)
                     if cmd == b'BIG':
                         for _ in range(big_size // len(block)):
@@ -1030,7 +2028,7 @@ class MultiplexedBridge(unittest.TestCase):
                     with contextlib.suppress(ConnectionError, OSError):
                         await writer.wait_closed()
 
-            backend = await asyncio.start_server(fake_microsocks, '127.0.0.1', 0)
+            backend = await asyncio.start_server(target_server, bind_ip, 0)
             backend_port = backend.sockets[0].getsockname()[1]
 
             class EchoUDP(asyncio.DatagramProtocol):
@@ -1041,14 +2039,13 @@ class MultiplexedBridge(unittest.TestCase):
                     self.transport.sendto(b'udp:' + data, addr)
 
             loop = asyncio.get_running_loop()
-            echo_transport, _ = await loop.create_datagram_endpoint(EchoUDP, local_addr=('127.0.0.1', 0))
+            echo_transport, _ = await loop.create_datagram_endpoint(EchoUDP, local_addr=(bind_ip, 0))
             echo_port = echo_transport.get_extra_info('sockname')[1]
 
             class LocalMuxTunnel(bridge.HostMuxTunnel):
                 async def _spawn_process(self):
                     return await asyncio.create_subprocess_exec(
-                        sys.executable, '-c', resources.guest_script('mux'),
-                        '127.0.0.1', str(backend_port),
+                        sys.executable, '-c', mux_code,
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
@@ -1059,20 +2056,18 @@ class MultiplexedBridge(unittest.TestCase):
             port = srv.sockets[0].getsockname()[1]
             try:
                 # 1. Client A triggers a 16 MiB download and STOPS reading (TCP zero window).
-                ra, wa = await asyncio.open_connection('127.0.0.1', port)
-                wa.write(b'\x05\x01\x00')
-                await wa.drain()
-                self.assertEqual(await ra.readexactly(2), b'\x05\x00')
+                ra, wa, rep_a, _, _ = await _socks5_connect(port, bind_ip, backend_port)
+                self.assertEqual(rep_a, 0x00)
                 wa.write(b'BIG')
                 await wa.drain()
                 # Give server time to fill stream A's entire 4 MiB credit window and pause.
                 await asyncio.sleep(0.5)
 
                 # 2. While A is stalled, Client B MUST complete handshake + TCP transfer fast!
-                rb, wb = await asyncio.wait_for(asyncio.open_connection('127.0.0.1', port), timeout=2.0)
-                wb.write(b'\x05\x01\x00')
-                await wb.drain()
-                self.assertEqual(await asyncio.wait_for(rb.readexactly(2), timeout=2.0), b'\x05\x00')
+                rb, wb, rep_b, _, _ = await asyncio.wait_for(
+                    _socks5_connect(port, bind_ip, backend_port), timeout=2.0,
+                )
+                self.assertEqual(rep_b, 0x00)
                 wb.write(b'SML')
                 await wb.drain()
                 self.assertEqual(await asyncio.wait_for(rb.readexactly(8), timeout=2.0), b'small-ok')
@@ -1093,7 +2088,7 @@ class MultiplexedBridge(unittest.TestCase):
                 us.bind(('127.0.0.1', 0))
                 us.setblocking(False)
                 try:
-                    pkt = b'\x00\x00\x00' + guest_mux.encode_socks_addr('127.0.0.1', echo_port) + b'fast'
+                    pkt = b'\x00\x00\x00' + guest_mux.encode_socks_addr(bind_ip, echo_port) + b'fast'
                     us.sendto(pkt, ('127.0.0.1', bnd_port))
                     ans = await asyncio.wait_for(loop.sock_recv(us, 4096), timeout=2.0)
                     _, _, _, off = guest_mux.parse_socks_addr(ans, 3)
@@ -1130,26 +2125,27 @@ class MultiplexedBridge(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'guest/mux.py stdio pipes run inside Linux containers')
     def test_udp_associate_end_to_end_ipv4_domain_auth_pinning_isolation_and_teardown(self):
         async def scenario():
-            async def fake_microsocks(reader, writer):
+            target_ip = _find_reachable_non_loopback_ipv4()
+            sandbox_fallback = target_ip is None
+            bind_ip = target_ip or '127.0.0.1'
+            mux_code = _mux_subprocess_source(allow_loopback_for_sandbox=sandbox_fallback)
+
+            async def tcp_echo(reader, writer):
                 try:
-                    greet = await reader.readexactly(3)
-                    if greet != b'\x05\x01\x00':
-                        return
-                    writer.write(b'\x05\x00')
-                    await writer.drain()
                     while data := await reader.read(4096):
                         writer.write(b'tcp:' + data)
                         await writer.drain()
-                except asyncio.IncompleteReadError:
+                except (ConnectionError, OSError):
                     pass
                 finally:
                     writer.close()
-                    await writer.wait_closed()
+                    with contextlib.suppress(ConnectionError, OSError):
+                        await writer.wait_closed()
 
-            backend = await asyncio.start_server(fake_microsocks, '127.0.0.1', 0)
+            backend = await asyncio.start_server(tcp_echo, bind_ip, 0)
             backend_port = backend.sockets[0].getsockname()[1]
 
-            # Real IPv4 UDP echo server
+            # Real IPv4 UDP echo server on bind_ip
             udp_hits = []
 
             class EchoUDP(asyncio.DatagramProtocol):
@@ -1162,20 +2158,9 @@ class MultiplexedBridge(unittest.TestCase):
 
             loop = asyncio.get_running_loop()
             echo_transport, _ = await loop.create_datagram_endpoint(
-                EchoUDP, local_addr=('127.0.0.1', 0),
+                EchoUDP, local_addr=(bind_ip, 0),
             )
             echo_port = echo_transport.get_extra_info('sockname')[1]
-
-            # Optional IPv6 UDP echo server (if host enables ::1)
-            echo6_transport = None
-            echo6_port = None
-            try:
-                echo6_transport, _ = await loop.create_datagram_endpoint(
-                    EchoUDP, local_addr=('::1', 0),
-                )
-                echo6_port = echo6_transport.get_extra_info('sockname')[1]
-            except OSError:
-                echo6_transport = None
 
             class LocalMuxTunnel(bridge.HostMuxTunnel):
                 def __init__(self, auth=None):
@@ -1185,8 +2170,7 @@ class MultiplexedBridge(unittest.TestCase):
                 async def _spawn_process(self):
                     self.spawns += 1
                     return await asyncio.create_subprocess_exec(
-                        sys.executable, '-c', resources.guest_script('mux'),
-                        '127.0.0.1', str(backend_port),
+                        sys.executable, '-c', mux_code,
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
@@ -1253,24 +2237,19 @@ class MultiplexedBridge(unittest.TestCase):
                 client_sock = make_udp_client()
                 try:
                     # IPv4 target roundtrip
-                    body_v4 = guest_mux.encode_socks_addr('127.0.0.1', echo_port) + b'hello-v4'
+                    body_v4 = guest_mux.encode_socks_addr(bind_ip, echo_port) + b'hello-v4'
                     reply = await udp_roundtrip(client_sock, (bnd_ip, bnd_port), body_v4)
                     self.assertEqual(reply[:3], b'\x00\x00\x00')
                     atyp, rhost, rport, off = guest_mux.parse_socks_addr(reply, 3)
-                    self.assertEqual((atyp, rhost, rport, reply[off:]), (1, '127.0.0.1', echo_port, b'echo:hello-v4'))
+                    self.assertEqual((atyp, rhost, rport, reply[off:]), (1, bind_ip, echo_port, b'echo:hello-v4'))
 
-                    # ATYP=0x03 domain ('localhost') resolution inside guest mux
-                    dom_body = b'\x03\x09localhost' + struct.pack('!H', echo_port) + b'hello-dns'
-                    reply = await udp_roundtrip(client_sock, (bnd_ip, bnd_port), dom_body)
-                    _, _, rport, off = guest_mux.parse_socks_addr(reply, 3)
-                    self.assertEqual((rport, reply[off:]), (echo_port, b'echo:hello-dns'))
-
-                    # IPv6 target cross-family over IPv4 client relay (if host has ::1)
-                    if echo6_port is not None:
-                        body_v6 = guest_mux.encode_socks_addr('::1', echo6_port) + b'hello-v6'
-                        reply6 = await udp_roundtrip(client_sock, (bnd_ip, bnd_port), body_v6)
-                        atyp6, rhost6, rport6, off6 = guest_mux.parse_socks_addr(reply6, 3)
-                        self.assertEqual((atyp6, rhost6, rport6, reply6[off6:]), (4, '::1', echo6_port, b'echo:hello-v6'))
+                    # Loopback UDP target must be dropped by SSRF filter when running unmodified mux
+                    if not sandbox_fallback:
+                        before = len(udp_hits)
+                        lo_body = b'\x03\x09localhost' + struct.pack('!H', echo_port) + b'blocked-lo'
+                        client_sock.sendto(b'\x00\x00\x00' + lo_body, (bnd_ip, bnd_port))
+                        await asyncio.sleep(0.15)
+                        self.assertEqual(len(udp_hits), before)
 
                     # FRAG != 0 must be dropped silently
                     before = len(udp_hits)
@@ -1278,16 +2257,14 @@ class MultiplexedBridge(unittest.TestCase):
                     await asyncio.sleep(0.15)
                     self.assertEqual(len(udp_hits), before)
 
-                    # Burst of 350 UDP datagrams must NOT stall concurrent TCP streams on the same mux!
+                    # Burst of 350 UDP datagrams must NOT stall concurrent TCP CONNECT on the same mux!
                     for idx in range(350):
                         client_sock.sendto(
-                            b'\x00\x00\x00' + guest_mux.encode_socks_addr('127.0.0.1', echo_port) + f'b{idx}'.encode(),
+                            b'\x00\x00\x00' + guest_mux.encode_socks_addr(bind_ip, echo_port) + f'b{idx}'.encode(),
                             (bnd_ip, bnd_port),
                         )
-                    tr, tw = await asyncio.open_connection('127.0.0.1', noauth_port)
-                    tw.write(b'\x05\x01\x00')
-                    await tw.drain()
-                    self.assertEqual(await tr.readexactly(2), b'\x05\x00')
+                    tr, tw, rep_t, _, _ = await _socks5_connect(noauth_port, bind_ip, backend_port)
+                    self.assertEqual(rep_t, 0x00)
                     tw.write(b'tcp-under-udp-burst')
                     tw.write_eof()
                     await tw.drain()
@@ -1318,14 +2295,14 @@ class MultiplexedBridge(unittest.TestCase):
                     # Packet from unpinned local port must be dropped
                     before = len(udp_hits)
                     other.sendto(
-                        b'\x00\x00\x00' + guest_mux.encode_socks_addr('127.0.0.1', echo_port) + b'wrong-port',
+                        b'\x00\x00\x00' + guest_mux.encode_socks_addr(bind_ip, echo_port) + b'wrong-port',
                         (abnd_ip, abnd_port),
                     )
                     await asyncio.sleep(0.15)
                     self.assertEqual(len(udp_hits), before)
 
                     # Packet from pinned port succeeds
-                    body_ok = guest_mux.encode_socks_addr('127.0.0.1', echo_port) + b'authed-udp'
+                    body_ok = guest_mux.encode_socks_addr(bind_ip, echo_port) + b'authed-udp'
                     reply = await udp_roundtrip(pinned, (abnd_ip, abnd_port), body_ok)
                     _, _, _, off = guest_mux.parse_socks_addr(reply, 3)
                     self.assertEqual(reply[off:], b'echo:authed-udp')
@@ -1377,8 +2354,6 @@ class MultiplexedBridge(unittest.TestCase):
                 await tunnel_noauth.close()
                 await tunnel_auth.close()
                 echo_transport.close()
-                if echo6_transport is not None:
-                    echo6_transport.close()
                 backend.close()
                 await backend.wait_closed()
                 await asyncio.sleep(0)
@@ -1445,6 +2420,50 @@ class MultiplexedBridge(unittest.TestCase):
                 mock.patch.object(bridge.asyncio, 'run', side_effect=fake_asyncio_run):
             bridge.run_bridge(eng, 'atrust')
             self.assertEqual(os.listdir(tmp), [])
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX subprocess signal test')
+    def test_host_mux_reaps_process_on_protocol_desync_and_send_if_open_handles_broken_pipe(self):
+        async def scenario():
+            bad_frame = struct.pack('>IBI', 1, guest_mux.DATA, guest_mux.MAX_FRAME + 1)
+            code = (
+                'import sys, time\n'
+                f'sys.stdout.buffer.write({bad_frame!r})\n'
+                'sys.stdout.buffer.flush()\n'
+                'time.sleep(30)\n'
+            )
+
+            spawned = []
+
+            class DesyncTunnel(bridge.HostMuxTunnel):
+                async def _spawn_process(self):
+                    proc = await asyncio.create_subprocess_exec(
+                        sys.executable, '-c', code,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    spawned.append(proc)
+                    return proc
+
+            tunnel = DesyncTunnel(mock.Mock(cli='docker'), 'zt-atrust', mux_source='')
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(ConnectionError):
+                    await tunnel.ensure_connected()
+                await asyncio.wait_for(tunnel._reader_task, timeout=5.0)
+                self.assertEqual(len(spawned), 1)
+                self.assertIsNotNone(spawned[0].returncode)
+                self.assertNotIn(spawned[0], tunnel._active_procs)
+
+                # send_if_open must swallow BrokenPipeError cleanly.
+                fake_stdin = mock.Mock()
+                fake_stdin.is_closing.return_value = False
+                fake_stdin.drain = mock.AsyncMock(side_effect=BrokenPipeError('closed'))
+                tunnel._process = mock.Mock(returncode=None, stdin=fake_stdin)
+                await tunnel.send_if_open(1, guest_mux.RST)
+                tunnel._process = None
+                await tunnel.close()
+
+        asyncio.run(scenario())
 
 
 class Engines(unittest.TestCase):
@@ -1556,7 +2575,36 @@ class Engines(unittest.TestCase):
             oci_path = Path(ctx_arg.split('=oci-layout://', 1)[1])
             self.assertTrue((oci_path / 'oci-layout').is_file())
 
-    def test_docker_net_mode_switches_to_subnet_for_accept_all_and_rootless_podman(self):
+        # Buildx < 0.13 splits base export (--output) and local load (--load) into two calls.
+        calls_old = []
+
+        def fake_cli_old(*args, quiet=False, check=True, timeout=None, env=None):
+            calls_old.append(args)
+            if '--output' in args:
+                out_spec = args[args.index('--output') + 1]
+                dest = out_spec.split('dest=', 1)[1].split(',tar=', 1)[0].strip('"')
+                (Path(dest) / 'oci-layout').write_text('{"imageLayoutVersion":"1.0.0"}\n', encoding='utf-8')
+            return self.answer()
+
+        eng_old = mock.Mock(
+            cli='docker', display_name='Docker',
+            needs_external_build_load=True, supports_multi_output_build=False,
+        )
+        eng_old.image_exists.return_value = False
+        eng_old.run_cli.side_effect = fake_cli_old
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {'ZT_CACHE': tmp}), \
+                mock.patch.object(build, 'build_context', return_value=(Path(tmp), 'deadbeef1234')), \
+                contextlib.redirect_stdout(io.StringIO()):
+            build.build(eng_old, 'base', force=True, arch='arm64')
+        self.assertEqual(len(calls_old), 2)
+        self.assertIn('--output', calls_old[0])
+        self.assertNotIn('--load', calls_old[0])
+        self.assertIn('--load', calls_old[1])
+        self.assertNotIn('--output', calls_old[1])
+        self.assertTrue(build._oci_context_ref('localhost/zt-base:1', Path('/tmp/a b')).startswith('"'))
+
+    def test_docker_net_mode_keeps_gateway_in_all_modes_and_subnet_for_podman(self):
         # Hostname containing 'podman' must NOT false-positive as Podman on regular Docker!
         docker = engine.DockerEngine()
         docker_info = json.dumps({
@@ -1569,7 +2617,7 @@ class Engines(unittest.TestCase):
             self.assertIsInstance(docker._daemon_traits, engine.DaemonTraits)
             self.assertEqual(docker.net_mode_for('local'), 'gateway')
             self.assertEqual(docker.net_mode_for('lan'), 'gateway')
-            self.assertEqual(docker.net_mode_for('all'), 'subnet')
+            self.assertEqual(docker.net_mode_for('all'), 'gateway')
 
         podman_rl = engine.DockerEngine()
         rl_info = json.dumps({
@@ -1577,23 +2625,26 @@ class Engines(unittest.TestCase):
             'SecurityOptions': ['name=rootless'],
         })
         with mock.patch.object(podman_rl, 'run_cli', return_value=self.answer(rl_info)):
-            flags = podman_rl.container_flags('all')
+            flags = podman_rl.container_flags('all', mac_address='02:7a:74:11:22:33')
             self.assertTrue(podman_rl.is_rootless_podman)
             self.assertEqual(podman_rl.net_mode_for('local'), 'subnet')
             self.assertIn('--privileged', flags)
             self.assertNotIn('--cap-add', flags)
+            self.assertNotIn('--mac-address', flags)
 
         # Rootful Podman (e.g. podman machine / netavark) also uses subnet mode without --privileged.
         podman_rf = engine.DockerEngine()
         rf_info = json.dumps({'ServerVersion': '6.0.2', 'SecurityOptions': ['name=selinux']})
         rf_ver = json.dumps({'Components': [{'Name': 'Podman Engine', 'Version': '6.0.2'}]})
         with mock.patch.object(podman_rf, 'run_cli', side_effect=[self.answer(rf_info), self.answer(rf_ver)]):
-            rf_flags = podman_rf.container_flags()
+            rf_flags = podman_rf.container_flags(mac_address='02:7a:74:aa:bb:cc')
             self.assertTrue(podman_rf.is_podman)
             self.assertFalse(podman_rf.is_rootless_podman)
             self.assertEqual(podman_rf.net_mode_for('local'), 'subnet')
             self.assertNotIn('--privileged', rf_flags)
             self.assertIn('label=disable', rf_flags)
+            self.assertIn('--mac-address', rf_flags)
+            self.assertIn('02:7a:74:aa:bb:cc', rf_flags)
 
     def test_docker_defaults_to_hardened_least_caps_and_conditional_selinux(self):
         env_clean = {k: v for k, v in os.environ.items() if k != 'ZT_CAPS'}
@@ -1617,6 +2668,34 @@ class Engines(unittest.TestCase):
             self.assertNotIn('/dev/net/tun', flags)
             self.assertIn('--pids-limit', flags)
             self.assertIn('1024', flags)
+            self.assertIn('--ulimit', flags)
+            self.assertIn('nofile=1024:65536', flags)
+            self.assertIn('core=0:0', flags)
+            for sysctl_kv in (
+                'net.ipv4.tcp_mtu_probing=1',
+                'net.ipv4.tcp_keepalive_time=60',
+                'net.ipv4.tcp_keepalive_intvl=15',
+                'net.ipv4.tcp_keepalive_probes=4',
+                'net.ipv4.tcp_retries2=8',
+            ):
+                self.assertIn(sysctl_kv, flags)
+            self.assertNotIn('net.ipv4.conf.all.rp_filter=2', flags)
+            self.assertNotIn('net.ipv4.conf.default.route_localnet=1', flags)
+
+            # Rootless Docker adds rp_filter=2, atrust-only default.route_localnet=1, and clamps NOFILE.
+            rl_docker = engine.DockerEngine()
+            rl_info = json.dumps({'SecurityOptions': ['name=rootless', 'name=seccomp']})
+            fake_res = mock.Mock(RLIMIT_NOFILE=7)
+            fake_res.getrlimit.return_value = (1024, 4096)
+            with mock.patch.object(rl_docker, 'run_cli', return_value=self.answer(rl_info)), \
+                    mock.patch.object(engine.sys, 'platform', 'linux'), \
+                    mock.patch.object(engine, 'resource', fake_res):
+                rl_atrust = rl_docker.container_flags(profile='atrust')
+                rl_ta = rl_docker.container_flags(profile='trustagent')
+            self.assertIn('nofile=1024:4096', rl_atrust)
+            self.assertIn('net.ipv4.conf.all.rp_filter=2', rl_atrust)
+            self.assertIn('net.ipv4.conf.default.route_localnet=1', rl_atrust)
+            self.assertNotIn('net.ipv4.conf.default.route_localnet=1', rl_ta)
             self.assertIn('/run:rw,nosuid,nodev,size=64m', flags)
             self.assertIn('/run/lock:rw,noexec,nosuid,nodev,size=16m', flags)
             self.assertNotIn('label=disable', flags)
@@ -1648,18 +2727,43 @@ class Engines(unittest.TestCase):
             self.assertIn('--cap-add', all_flags)
             self.assertIn('ALL', all_flags)
 
-            # Linux Docker Desktop (VM) is not mislabeled as shared-kernel rootful
-            dd_docker = engine.DockerEngine()
-            dd_info = json.dumps({'OperatingSystem': 'Docker Desktop', 'SecurityOptions': ['name=seccomp']})
-            with mock.patch.object(dd_docker, 'run_cli', return_value=self.answer(dd_info)), \
-                    mock.patch.object(engine.sys, 'platform', 'linux'):
-                self.assertTrue(dd_docker.is_desktop_vm)
-                self.assertFalse(dd_docker.is_linux_rootful)
+            # Linux Docker Desktop / OrbStack / Colima / Lima / Rancher Desktop VM detection
+            for vm_info in (
+                {'OperatingSystem': 'Docker Desktop', 'SecurityOptions': ['name=seccomp']},
+                {'OperatingSystem': 'OrbStack', 'SecurityOptions': ['name=seccomp']},
+                {'Name': 'colima-default', 'SecurityOptions': ['name=seccomp']},
+                {'Name': 'lima-docker', 'SecurityOptions': ['name=seccomp']},
+                {'OperatingSystem': 'Rancher Desktop WSL Distro', 'SecurityOptions': ['name=seccomp']},
+            ):
+                vm_docker = engine.DockerEngine()
+                with mock.patch.object(vm_docker, 'run_cli', return_value=self.answer(json.dumps(vm_info))), \
+                        mock.patch.object(engine.sys, 'platform', 'linux'):
+                    self.assertTrue(vm_docker.is_desktop_vm, vm_info)
+                    self.assertFalse(vm_docker.is_linux_rootful, vm_info)
 
-            # Apple Container keeps microVM default CAPS=all and supports CAPS=least
+            # 256m shm-size, cross-arch 3g/3G memory bump, and deterministic MAC flags
+            self.assertEqual(flags[flags.index('--shm-size') + 1], '256m')
+            with mock.patch.object(engine.platform, 'machine', return_value='arm64'):
+                native_flags = docker.container_flags(arch='arm64', mac_address='02:7a:74:01:02:03')
+                cross_flags = docker.container_flags(arch='amd64', mac_address='02:7a:74:01:02:03')
+            self.assertEqual(native_flags[native_flags.index('--memory') + 1], '2g')
+            self.assertEqual(cross_flags[cross_flags.index('--memory') + 1], '3g')
+            self.assertIn('--mac-address', native_flags)
+            self.assertIn('02:7a:74:01:02:03', native_flags)
+
+            # Apple Container keeps microVM default CAPS=all, supports CAPS=least, 3G cross-arch, and ,mac=
             apple = engine.AppleContainerEngine()
+            apple.__dict__['_run_help_text'] = '--ulimit <spec> --network default,mac=xx:xx:xx:xx:xx:xx'
             self.assertEqual(apple.resolved_caps(), 'all')
-            self.assertIn('ALL', apple.container_flags())
+            with mock.patch.object(engine.platform, 'machine', return_value='arm64'):
+                a_native = apple.container_flags(arch='arm64', mac_address='02:7a:74:de:ad:be')
+                a_cross = apple.container_flags(arch='amd64', mac_address='02:7a:74:de:ad:be')
+            self.assertIn('ALL', a_native)
+            self.assertEqual(a_native[a_native.index('--shm-size') + 1], '256m')
+            self.assertEqual(a_native[a_native.index('--memory') + 1], '2G')
+            self.assertEqual(a_cross[a_cross.index('--memory') + 1], '3G')
+            self.assertIn('--network', a_native)
+            self.assertIn('default,mac=02:7a:74:de:ad:be', a_native)
             self.assertNotIn('--cap-drop', apple.container_flags('least'))
             self.assertIn('NET_ADMIN', apple.container_flags('least'))
             self.assertIn('SYS_ADMIN', apple.container_flags('least'))
@@ -2048,22 +3152,156 @@ class EncapsulatedCLI(unittest.TestCase):
         self.assertNotIn(staging, tags)
         self.assertIn(('image', 'tag', staging, ref), cli_calls)
 
-    def test_ensure_container_attaches_persistent_volume_and_binds_loopback_in_lan_mode(self):
-        eng = mock.Mock(cli='container', display_name='Apple Container')
-        eng.inspect.return_value = None
-        eng.port_holders.return_value = None
-        eng.container_state.return_value = 'running'
-        eng.fingerprint.return_value = 'abc123'
-        with contextlib.redirect_stdout(io.StringIO()):
-            problem = cli.ensure_container(eng, 'atrust', {'ZT_AUTH': '0'}, mode='lan', arch='amd64')
-        self.assertIsNone(problem)
-        eng.ensure_volume.assert_called_once_with('zt-state-atrust', 'atrust')
-        eng.run_container.assert_called_once()
-        args = eng.run_container.call_args
-        self.assertEqual(args.args[3], spec.desktop_backend_port('atrust'))
-        self.assertEqual(args.kwargs['bind_host'], '127.0.0.1')
-        self.assertEqual(args.kwargs['arch'], 'amd64')
-        self.assertEqual(args.kwargs['volume'], 'zt-state-atrust')
+    def test_ensure_container_attaches_persistent_volume_and_binds_loopback_in_lan_and_all_modes(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {'ZT_STATE': tmp}):
+            seen_macs = []
+            for mode in ('lan', 'all'):
+                eng = mock.Mock(cli='container', display_name='Apple Container')
+                eng.inspect.return_value = None
+                eng.port_holders.return_value = None
+                eng.container_state.return_value = 'running'
+                eng.fingerprint.return_value = 'abc123'
+                with contextlib.redirect_stdout(io.StringIO()):
+                    problem = cli.ensure_container(eng, 'atrust', {'ZT_AUTH': '0'}, mode=mode, arch='amd64')
+                self.assertIsNone(problem, mode)
+                eng.ensure_volume.assert_called_once_with('zt-state-atrust', 'atrust')
+                eng.run_container.assert_called_once()
+                args = eng.run_container.call_args
+                self.assertEqual(args.args[3], spec.desktop_backend_port('atrust'))
+                self.assertEqual(args.kwargs['bind_host'], '127.0.0.1')
+                self.assertEqual(args.kwargs['arch'], 'amd64')
+                self.assertEqual(args.kwargs['volume'], 'zt-state-atrust')
+                mac = args.kwargs['mac_address']
+                self.assertRegex(mac, r'^02:7a:74:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}$')
+                self.assertEqual(eng.fingerprint.call_args.kwargs['mac_address'], mac)
+                seen_macs.append(mac)
+            # Same (profile, engine) MUST reuse the exact same MAC across recreates.
+            self.assertEqual(seen_macs[0], seen_macs[1])
+            id_file = config.identity_file('atrust')
+            self.assertTrue(id_file.is_file())
+            if os.name != 'nt':
+                self.assertEqual(id_file.stat().st_mode & 0o777, 0o600)
+
+    def test_up_exits_nonzero_on_bridge_failure_and_status_shows_vpn_sso_and_disk_warning(self):
+        eng = mock.Mock(cli='docker', display_name='Docker', is_rootless_podman=False, is_linux_rootful=False)
+        eng.resolved_caps.return_value = 'least'
+        eng.net_mode_for.return_value = 'gateway'
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / 'config'
+            st = Path(tmp) / 'state'
+            env = {k: v for k, v in os.environ.items() if not k.startswith('ZT_')}
+            env.update({'ZT_CONFIG': str(cfg), 'ZT_STATE': str(st), 'ZT_ACCEPT': 'local'})
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(cli, 'make_engine', return_value=eng), \
+                    mock.patch.object(cli, 'ensure_image'), \
+                    mock.patch.object(cli, 'ensure_container', return_value=None), \
+                    mock.patch.object(cli, 'bridge_start', return_value='port 16902 held by foo'), \
+                    mock.patch.object(cli, 'cmd_status'), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()) as err, \
+                    self.assertRaises(SystemExit) as ex:
+                cli.cmd_up(argparse.Namespace(target='trustagent'))
+            self.assertEqual(ex.exception.code, 1)
+            self.assertIn('port 16902 held by foo', err.getvalue())
+
+            # cmd_status renders vpn column, active SSO URL, and >=85% disk warning from health-<profile>.json
+            now = int(cli.time.time())
+            with mock.patch.dict(os.environ, env, clear=True):
+                config.write_private_file(
+                    config.health_file('trustagent'),
+                    json.dumps({
+                        'vpn': 'connected', 'iface': 'vnic0', 'updated_at': now,
+                        'state_used_pct': 88, 'state_avail_mb': 240,
+                    }),
+                )
+                config.write_private_file(
+                    config.health_file('atrust'),
+                    json.dumps({
+                        'vpn': 'sso-pending', 'updated_at': now,
+                        'sso_url': 'https://sso.corp.example/login', 'sso_ts': now,
+                        'callback_ports': [54631],
+                    }),
+                )
+                eng.inspect.side_effect = lambda n: {
+                    'status': {'state': 'running'},
+                    'configuration': {'labels': {'zt.image': build.current_ref(n[3:], 'arm64')}},
+                } if n in ('zt-trustagent', 'zt-atrust') else None
+                with mock.patch.object(cli, 'target_arch', return_value='arm64'), \
+                        mock.patch.object(cli, 'bridge_record', return_value=(None,) * 5), \
+                        mock.patch.object(cli, 'socks_any_listener', return_value=False), \
+                        contextlib.redirect_stdout(io.StringIO()) as out, \
+                        contextlib.redirect_stderr(io.StringIO()) as err:
+                    cli.cmd_status(argparse.Namespace(target='all'), engine=eng)
+            rendered = out.getvalue()
+            self.assertIn('vpn', rendered)
+            self.assertIn('connected (vnic0)', rendered)
+            self.assertIn('sso-pending', rendered)
+            self.assertIn('https://sso.corp.example/login', rendered)
+            self.assertIn('127.0.0.1:54631', rendered)
+            self.assertIn('state volume 88% full (240 MB free)', err.getvalue())
+
+    def test_doctor_linux_and_macos_host_prechecks(self):
+        # Linux prechecks: missing /dev/net/tun, apparmor userns=1 on rootless, missing binfmt F flag
+        seen = []
+
+        def record(name, good, detail=''):
+            seen.append((name, good, detail))
+
+        eng_rl = mock.Mock(is_rootless=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_aa = Path(tmp) / 'aa'
+            fake_aa.write_text('1\n', encoding='utf-8')
+            fake_cg = Path(tmp) / 'cgroup.controllers'
+            fake_cg.write_text('cpu io\n', encoding='utf-8')
+            fake_binfmt = Path(tmp) / 'binfmt'
+            fake_binfmt.mkdir()
+            (fake_binfmt / 'qemu-x86_64').write_text('enabled\nflags: OC\n', encoding='utf-8')
+
+            real_path = cli.Path
+
+            def fake_path(p):
+                s = str(p)
+                if s == '/dev/net/tun':
+                    return Path(tmp) / 'missing-tun'
+                if s == '/proc/sys/kernel/apparmor_restrict_unprivileged_userns':
+                    return fake_aa
+                if s.endswith('/cgroup.controllers'):
+                    return fake_cg
+                if s == '/proc/sys/fs/binfmt_misc':
+                    return fake_binfmt
+                return real_path(p)
+
+            with mock.patch.object(cli, 'Path', side_effect=fake_path), \
+                    mock.patch.object(cli.platform, 'machine', return_value='aarch64'):
+                cli._check_linux_host_prechecks(eng_rl, 'amd64', record)
+
+        by_name = {n: (g, d) for n, g, d in seen}
+        self.assertFalse(by_name['/dev/net/tun'][0])
+        self.assertFalse(by_name['apparmor userns'][0])
+        self.assertFalse(by_name['cgroup v2 delegate'][0])
+        self.assertFalse(by_name['binfmt (amd64)'][0])
+
+        # macOS cross-arch Rosetta check
+        mac_seen = []
+        with mock.patch.object(cli.platform, 'machine', return_value='arm64'), \
+                mock.patch.object(cli, 'Path', side_effect=lambda p: mock.Mock(exists=lambda: False)):
+            cli._check_macos_cross_arch('amd64', lambda n, g, d='': mac_seen.append((n, g, d)))
+        self.assertEqual(len(mac_seen), 1)
+        self.assertEqual(mac_seen[0][0], 'rosetta (amd64)')
+        self.assertFalse(mac_seen[0][1])
+
+    def test_ensure_container_treats_stopped_as_immediate_exit(self):
+        for terminal_state in ('exited', 'dead', 'stopped'):
+            eng = mock.Mock(cli='container', display_name='Apple Container')
+            eng.inspect.return_value = None
+            eng.port_holders.return_value = None
+            eng.container_state.return_value = terminal_state
+            eng.fingerprint.return_value = 'abc123'
+            with contextlib.redirect_stdout(io.StringIO()):
+                problem = cli.ensure_container(eng, 'trustagent', {'ZT_AUTH': '0'}, mode='local', arch='arm64')
+            self.assertIsNotNone(problem, terminal_state)
+            self.assertIn('exited as soon as it started', problem)
 
     def test_doctor_checks_orthogonal_password_across_all_accept_modes(self):
         eng = mock.Mock(cli='container', display_name='Apple Container')
@@ -2091,7 +3329,7 @@ class EncapsulatedCLI(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()) as out, \
                         self.assertRaises(SystemExit):
                     cli.cmd_doctor(argparse.Namespace())
-                self.assertIn('FAIL password              must be 6 to 8 characters (got 3)', out.getvalue())
+                self.assertIn('FAIL password              must be 6 to 128 characters (got 3)', out.getvalue())
 
             with mock.patch.object(cli, 'make_engine', return_value=eng), \
                     mock.patch.dict(os.environ, {'ZT_CONFIG': cfg, 'ZT_ACCEPT': 'all', 'ZT_VNC_PW': ''}), \
@@ -2101,11 +3339,18 @@ class EncapsulatedCLI(unittest.TestCase):
             self.assertIn('FAIL password              required for accept all', out.getvalue())
 
             with mock.patch.object(cli, 'make_engine', return_value=eng), \
-                    mock.patch.dict(os.environ, {'ZT_CONFIG': cfg, 'ZT_ACCEPT': 'all', 'ZT_VNC_PW': 'too-long-12345'}), \
+                    mock.patch.dict(os.environ, {'ZT_CONFIG': cfg, 'ZT_ACCEPT': 'all', 'ZT_VNC_PW': 'strong-passphrase-1234'}), \
                     contextlib.redirect_stdout(io.StringIO()) as out, \
                     self.assertRaises(SystemExit):
                 cli.cmd_doctor(argparse.Namespace())
-            self.assertIn('FAIL password              must be 6 to 8 characters (got 14)', out.getvalue())
+            self.assertIn('OK   password              set (required on desktop and SOCKS5', out.getvalue())
+
+            with mock.patch.object(cli, 'make_engine', return_value=eng), \
+                    mock.patch.dict(os.environ, {'ZT_CONFIG': cfg, 'ZT_ACCEPT': 'all', 'ZT_VNC_PW': 'a' * 129}), \
+                    contextlib.redirect_stdout(io.StringIO()) as out, \
+                    self.assertRaises(SystemExit):
+                cli.cmd_doctor(argparse.Namespace())
+            self.assertIn('FAIL password              must be 6 to 128 characters (got 129)', out.getvalue())
 
     def test_linux_rootful_docker_warns_on_caps_all_and_reports_capabilities_in_doctor(self):
         docker = engine.DockerEngine()
@@ -2171,7 +3416,7 @@ class EncapsulatedCLI(unittest.TestCase):
         base_sha = spec.blobs_for(spec.BASE, 'arm64')[0][2]
 
         with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.dict(os.environ, {'ZT_CACHE': tmp}), \
+                mock.patch.dict(os.environ, {'ZT_CACHE': tmp, 'ZT_STATE': str(Path(tmp) / 'state')}), \
                 mock.patch.object(cli, 'make_engine', return_value=eng), \
                 mock.patch.object(cli, 'bridge_stop') as bstop:
             cache = Path(tmp)
@@ -2180,6 +3425,8 @@ class EncapsulatedCLI(unittest.TestCase):
             (cache / 'blobs').mkdir(parents=True)
             (cache / 'blobs' / atrust_sha).write_bytes(b'atrust-deb')
             (cache / 'blobs' / base_sha).write_bytes(b'kasm-deb')
+            config.ensure_identity_mac('atrust', 'container')
+            config.write_private_file(config.health_file('atrust'), '{"vpn":"connected"}\n')
 
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 cli.main(['purge', 'atrust'])
@@ -2189,6 +3436,8 @@ class EncapsulatedCLI(unittest.TestCase):
             eng.run_cli.assert_any_call('image', 'rm', 'localhost/zt-atrust:1.0-arm64-abc', quiet=True, check=False)
             self.assertFalse((cache / 'build' / 'atrust-arm64-1234').exists())
             self.assertFalse((cache / 'blobs' / atrust_sha).exists())
+            self.assertFalse(config.identity_file('atrust').exists())
+            self.assertFalse(config.health_file('atrust').exists())
             self.assertTrue((cache / 'build' / 'base-arm64-9999').exists())
             self.assertTrue((cache / 'blobs' / base_sha).exists())
             self.assertIn('state volume removed', out.getvalue())
@@ -2267,6 +3516,78 @@ class FromAnotherContainer(unittest.TestCase):
             ipaddress.ip_network(cidr, strict=False),
             ipaddress.ip_network('fda0:b0d:9d48:31ac::beef/80', strict=False),
         )
+
+    def test_two_boot_stateful_verify_and_cli_entry(self):
+        # 1. compare_identity_snapshots catches drift, missing fields, and wrong MAC
+        snap1 = {
+            'machine_id': '0123456789abcdef0123456789abcdef',
+            'dbus_machine_id': '0123456789abcdef0123456789abcdef',
+            'smbios_sha256': 'c' * 64,
+            'has_dmi_id': True,
+            'product_uuid': '11111111-2222-4333-8444-555555555555',
+            'product_serial': 'ZT-ABCDEF123456',
+            'eth0_mac': '02:7a:74:11:22:33',
+            'tls_cert_sha256': 'a' * 64,
+        }
+        err, detail = verify.compare_identity_snapshots(snap1, dict(snap1), expected_mac='02:7a:74:11:22:33')
+        self.assertIsNone(err)
+        self.assertIn('2-boot volume persisted', detail)
+        drifted = {**snap1, 'tls_cert_sha256': 'b' * 64}
+        err, _ = verify.compare_identity_snapshots(snap1, drifted, expected_mac='02:7a:74:11:22:33')
+        self.assertIn('tls_cert_sha256 drifted', err)
+        err, _ = verify.compare_identity_snapshots(snap1, dict(snap1), expected_mac='02:7a:74:aa:bb:cc')
+        self.assertIn('eth0_mac=', err)
+
+        # 2. verify() creates temp volume, boots twice with identical volume+MAC, and cleans both up
+        eng = mock.Mock(cli='docker', is_rootless_podman=False)
+        eng.net_mode_for.return_value = 'gateway'
+        eng.image_exists.return_value = True
+        eng.run_cli.return_value = mock.Mock(returncode=0)
+        run_calls = []
+
+        def fake_run(name, ref, env, port, labels, **kwargs):
+            run_calls.append((name, ref, kwargs.get('volume'), kwargs.get('mac_address')))
+
+        eng.run_container.side_effect = fake_run
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {'ZT_CONFIG': str(Path(tmp) / 'cfg'), 'ZT_ACCEPT': 'local'}), \
+                mock.patch.object(verify, 'free_port', return_value=19999), \
+                mock.patch.object(verify, 'wait_for_desktop', return_value=(True, 200)), \
+                mock.patch.object(verify, 'guest_report', return_value=[('units', 'ok', '')]), \
+                mock.patch.object(verify, 'mux_e2e_holds', return_value=(None, 'ok')), \
+                mock.patch.object(verify, 'host_only_holds', return_value=(None, 'ok')), \
+                mock.patch.object(verify, '_random_verify_mac', return_value='02:7a:74:11:22:33'), \
+                mock.patch.object(verify, 'capture_identity_snapshot', return_value=snap1), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            failures = verify.verify(eng, 'trustagent', mode='local', arch='arm64')
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(run_calls), 2)
+        self.assertEqual(run_calls[0][2], run_calls[1][2])
+        self.assertTrue(run_calls[0][2].startswith('zt-verify-state-trustagent-'))
+        self.assertEqual(run_calls[0][3], '02:7a:74:11:22:33')
+        self.assertEqual(run_calls[1][3], '02:7a:74:11:22:33')
+        eng.ensure_volume.assert_called_once_with(run_calls[0][2], 'trustagent')
+        eng.remove_volume.assert_called_once_with(run_calls[0][2])
+        self.assertIn('ok   persistence:', out.getvalue())
+
+        # 3. python3 -m zt.verify CLI argument parser & exit code contract
+        parsed = verify.parse_args(['--profile', 'atrust', '--accept', 'all', '--arch', 'amd64', '--build', '--keep'])
+        self.assertEqual((parsed.profile, parsed.mode, parsed.arch, parsed.build, parsed.keep),
+                         ('atrust', 'all', 'amd64', True, True))
+        defaults = verify.parse_args([])
+        self.assertEqual((defaults.profile, defaults.mode, defaults.arch, defaults.build, defaults.keep),
+                         ('trustagent', None, None, False, False))
+
+        with mock.patch.object(verify, 'make_engine', return_value=eng), \
+                mock.patch.object(verify, 'build') as mbuild, \
+                mock.patch.object(verify, 'verify', return_value=[]) as mver, \
+                self.assertRaises(SystemExit) as ex:
+            verify.main(['--profile', 'trustagent', '--accept', 'local', '--arch', 'arm64', '--build'])
+        self.assertEqual(ex.exception.code, 0)
+        mbuild.assert_called_once_with(eng, 'trustagent', arch='arm64')
+        mver.assert_called_once_with(eng, 'trustagent', mode='local', arch='arm64', keep=False)
 
 
 class Installers(unittest.TestCase):

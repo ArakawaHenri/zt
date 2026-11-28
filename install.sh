@@ -63,7 +63,8 @@ download() {
 }
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zt-install.XXXXXX")"
-cleanup() { rm -rf "$TMP_DIR"; }
+STAGE=""
+cleanup() { rm -rf "$TMP_DIR" "${STAGE:-}"; }
 trap cleanup EXIT HUP INT TERM
 
 # 4. Resolve latest stable release (or user-specified ZT_VERSION).
@@ -136,10 +137,11 @@ PY
 
 # 6. Install atomically into INSTALL_DIR.
 mkdir -p "$INSTALL_DIR"
-STAGE="$INSTALL_DIR/.zt.tmp.$$"
+STAGE="$(mktemp "${INSTALL_DIR}/.zt.XXXXXX")"
 cp "$TMP_DIR/zt" "$STAGE"
 chmod 0755 "$STAGE"
 mv -f "$STAGE" "$INSTALL_DIR/zt"
+STAGE=""
 
 INSTALLED_VER="$("$INSTALL_DIR/zt" --version 2>/dev/null || printf 'zt %s' "$TAG")"
 say "Installed ${INSTALLED_VER} to ${INSTALL_DIR}/zt"

@@ -136,15 +136,22 @@ CLIENTS = {
         'ui': 'TrustAgent',
         'units': (
             'trustdservice.service', 'trustservice.service', 'trustservicemgr.service',
-            'trustnet.service', 'zt-net.service', 'zt-socks.service',
+            'trustnet.service', 'zt-net.service',
         ),
         'nnp_units': (
-            'kasmvnc.service', 'zt-socks.service',
+            'kasmvnc.service',
             'trustdservice.service', 'trustservice.service',
             'trustservicemgr.service', 'trustnet.service',
         ),
         'libs': ('bin/libQTrustWebView.so', 'lib/libQt5WebEngineCore.so.5', 'lib/QtWebEngineProcess'),
         'quiet': ('Driver not loaded',),
+        'extra_logs': (
+            ('/var/log/TrustAgent/trustdservice.log', ('GetBaseDmiInfo failed', '"uuid":""')),
+        ),
+        'mid_url': (
+            'https://127.0.0.1:39301/_zerotrust/agent'
+            '?method=get_mid&callback=&challenge=00000000000000000000000000000000&version=v2&encode=none'
+        ),
         'root_runs': (),
         'desktop_writes': ('/var/log/TrustAgent',),
         'setuid': (),
@@ -162,9 +169,9 @@ CLIENTS = {
         'vendor': '/usr/share/sangfor',
         'launch': None,
         'ui': 'aTrustTray',
-        'units': ('zt-net.service', 'zt-sangfor.service', 'zt-socks.service'),
+        'units': ('zt-net.service', 'zt-sangfor-daemon.service', 'zt-sangfor-ui.service'),
         'nnp_units': (
-            'kasmvnc.service', 'zt-socks.service', 'zt-sangfor.service',
+            'kasmvnc.service', 'zt-sangfor-daemon.service', 'zt-sangfor-ui.service',
             'aTrustDaemon.service', 'eaio_service.service',
         ),
         'quiet': ('error while loading shared libraries',),
@@ -192,9 +199,9 @@ CLIENTS = {
         'vendor': '/usr/share/sangfor',
         'launch': None,
         'ui': 'EasyConnect',
-        'units': ('zt-net.service', 'zt-sangfor.service', 'zt-socks.service'),
+        'units': ('zt-net.service', 'zt-sangfor-daemon.service', 'zt-sangfor-ui.service'),
         'nnp_units': (
-            'kasmvnc.service', 'zt-socks.service', 'zt-sangfor.service',
+            'kasmvnc.service', 'zt-sangfor-daemon.service', 'zt-sangfor-ui.service',
             'EasyMonitor.service',
         ),
         'quiet': ('error while loading shared libraries',),
@@ -227,24 +234,31 @@ ENGINES = ('container', 'docker')
 ENGINE_NAMES = {'container': 'Apple Container', 'docker': 'Docker'}
 STAND_IN = 16999
 STATE_MOUNT = '/var/lib/zt-state'
+CALLBACK_PORTS = {
+    'trustagent': (39301,),
+    'atrust': (54631,),
+    'easyconnect': (54530,),
+}
 
 # Canonical executable overlay paths (used to normalize POSIX modes on Windows NTFS).
 EXECUTABLE_OVERLAYS = frozenset((
     'base/rootfs/usr/local/bin/zt-kasmvnc.sh',
+    'common/rootfs/usr/bin/xdg-open',
+    'common/rootfs/usr/local/bin/zt-identity',
     'common/rootfs/usr/local/bin/zt-init',
     'common/rootfs/usr/local/bin/zt-net-setup.sh',
+    'common/rootfs/usr/local/sbin/zt-iptables',
     'sangfor/common/install-deb.sh',
-    'sangfor/common/rootfs/usr/bin/xdg-open',
     'sangfor/atrust/rootfs/usr/bin/loginctl',
     'sangfor/atrust/rootfs/usr/sbin/sysctl-hook',
-    'sangfor/atrust/rootfs/usr/local/bin/zt-sangfor-session.sh',
+    'sangfor/atrust/rootfs/usr/local/bin/zt-sangfor-daemon.sh',
+    'sangfor/atrust/rootfs/usr/local/bin/zt-sangfor-ui.sh',
     'sangfor/easyconnect/rootfs/usr/local/bin/zt-conf.sh',
-    'sangfor/easyconnect/rootfs/usr/local/bin/zt-sangfor-session.sh',
+    'sangfor/easyconnect/rootfs/usr/local/bin/zt-sangfor-daemon.sh',
+    'sangfor/easyconnect/rootfs/usr/local/bin/zt-sangfor-ui.sh',
     'sangfor/easyconnect/rootfs/usr/share/sangfor/EasyConnect/resources/shell/open_browser.sh',
     'trustagent/rootfs/usr/bin/nmcli',
     'trustagent/rootfs/usr/local/bin/zt-trustagent-routes.sh',
-    'trustagent/rootfs/usr/local/bin/zt-vnic-add.sh',
-    'trustagent/rootfs/usr/local/bin/zt-vnic-remove.sh',
 ))
 
 # Stock setuid/setgid executables on official ubuntu:24.04 + base packages
@@ -302,8 +316,12 @@ CHECKS = (
     'ui',
     'libraries',
     'policy',
+    'routing',
+    'loopback_isolation',
     'tunnel',
     'timezone',
+    'identity',
+    'limits',
     'log',
     'privilege',
     'setuid',
@@ -372,7 +390,7 @@ def socks_port(profile):
 
 
 def desktop_backend_port(profile):
-    """Internal loopback port used by containers in `accept lan` mode behind the LAN guard."""
+    """Internal loopback port used by containers in `accept lan` / `accept all` modes behind the host bridge."""
     return desktop_port(profile) + 5
 
 

@@ -207,6 +207,26 @@ def _normalize_context_modes(root, spec):
                     full.chmod(mode & ~0o022)
 
 
+def _context_blobs_valid(context, spec, arch):
+    """True when every declared blob in a cached build context exists and matches its SHA-256."""
+    if not (context / spec['dockerfile']).is_file():
+        return False
+    expected_blobs = blobs_for(spec, arch)
+    if not expected_blobs:
+        return True
+    blobs_dir = context / 'blobs'
+    for filename, _url, expected_sha256 in expected_blobs:
+        blob_path = blobs_dir / filename
+        if not blob_path.is_file() or blob_path.is_symlink():
+            return False
+        try:
+            if _sha256_file(blob_path) != expected_sha256:
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def build_context(name, arch=None):
     """Return (context_dir, digest): self-contained overlays + hardlinked verified blobs."""
     arch = arch or target_arch()
@@ -214,8 +234,20 @@ def build_context(name, arch=None):
     digest = content_hash(spec, arch)
     context = cache_dir() / 'build' / f'{name}-{arch}-{digest}'
     if context.is_dir():
-        _normalize_context_modes(context, spec)
-        return context, digest
+        if _context_blobs_valid(context, spec, arch):
+            _normalize_context_modes(context, spec)
+            return context, digest
+        warn(f'zt: cached build context for {name} ({arch}) failed SHA256 verification; rebuilding')
+        blobs_cache = cache_dir() / 'blobs'
+        for _filename, _url, expected_sha256 in blobs_for(spec, arch):
+            cached = blobs_cache / expected_sha256
+            if cached.is_file():
+                try:
+                    if _sha256_file(cached) != expected_sha256:
+                        cached.unlink(missing_ok=True)
+                except OSError:
+                    cached.unlink(missing_ok=True)
+        shutil.rmtree(context, ignore_errors=True)
     blobs = [
         (filename, fetch_blob(filename, url, sha256))
         for filename, url, sha256 in blobs_for(spec, arch)
@@ -262,12 +294,26 @@ def _csv_quote(value):
     return text
 
 
+def _oci_dest_path(path):
+    """Format a local OCI directory path safely across POSIX and Windows (forward slashes)."""
+    return Path(path).resolve().as_posix()
+
+
+def _oci_context_ref(base_ref, base_oci):
+    """Format `--build-context <ref>=oci-layout://<path>` safely on POSIX and Windows."""
+    raw = _oci_dest_path(base_oci)
+    if any(ch in raw for ch in (',', '"', ' ', '\t')):
+        return _csv_quote(f'{base_ref}=oci-layout://{raw}')
+    return f'{base_ref}=oci-layout://{raw}'
+
+
 def build(engine, name, force=False, arch=None, tag=None):
     """Build `name` if missing (or forced), returning its image ref (or custom `tag`)."""
     arch = arch or target_arch()
     spec = spec_of(name)
     ref = tag or current_ref(name, arch)
     external_builder = getattr(engine, 'needs_external_build_load', False) is True
+    multi_output = getattr(engine, 'supports_multi_output_build', True) is not False
     base_oci = _base_oci_dir(arch) if external_builder else None
     oci_ready = (name != 'base') or (not external_builder) or (base_oci / 'oci-layout').is_file()
     if engine.image_exists(ref) and not force and oci_ready:
@@ -278,32 +324,39 @@ def build(engine, name, force=False, arch=None, tag=None):
     context, _ = build_context(name, arch=arch)
     say(f'==> building {ref} ({platform_for(arch)})')
 
+    common_args = [
+        'build',
+        '--platform', platform_for(arch),
+        '-f', str(context / spec['dockerfile']),
+        '-t', ref,
+        '--label', 'org.zt.managed=true',
+        '--label', f'org.zt.profile={name}',
+        '--label', f'org.zt.arch={arch}',
+        *[f'--build-arg={key}={value}' for key, value in build_args(spec, arch).items()],
+    ]
     extra_args = []
+    need_second_load = False
     staging_oci = None
     if external_builder:
-        extra_args.append('--load')
         if name == 'base':
             base_oci.parent.mkdir(parents=True, exist_ok=True)
             staging_oci = Path(tempfile.mkdtemp(prefix=f'.base-{arch}-', dir=base_oci.parent))
-            extra_args += ['--output', f'type=oci,dest={_csv_quote(staging_oci)},tar=false']
+            oci_out = f'type=oci,dest={_csv_quote(_oci_dest_path(staging_oci))},tar=false'
+            if multi_output:
+                extra_args += ['--load', '--output', oci_out]
+            else:
+                # Buildx < 0.13 rejects combining --load with --output; export OCI
+                # first, then run a cached --load pass into the local image store.
+                extra_args += ['--output', oci_out]
+                need_second_load = True
         else:
             base_ref = current_ref('base', arch)
-            extra_args += ['--build-context', f'{base_ref}=oci-layout://{base_oci.as_posix()}']
+            extra_args += ['--load', '--build-context', _oci_context_ref(base_ref, base_oci)]
 
     try:
-        engine.run_cli(
-            'build',
-            '--platform', platform_for(arch),
-            '-f', str(context / spec['dockerfile']),
-            '-t', ref,
-            '--label', 'org.zt.managed=true',
-            '--label', f'org.zt.profile={name}',
-            '--label', f'org.zt.arch={arch}',
-            *[f'--build-arg={key}={value}' for key, value in build_args(spec, arch).items()],
-            *extra_args,
-            str(context),
-            timeout=3600,
-        )
+        engine.run_cli(*common_args, *extra_args, str(context), timeout=3600)
+        if need_second_load:
+            engine.run_cli(*common_args, '--load', str(context), timeout=3600)
         if staging_oci is not None:
             if not (staging_oci / 'oci-layout').is_file():
                 die(f'buildx did not export OCI layout for {ref}')

@@ -1,0 +1,31 @@
+[Unit]
+Description=Sangfor VPN client desktop UI
+Requires=zt-net.service
+BindsTo=kasmvnc.service
+After=zt-net.service kasmvnc.service zt-sangfor-daemon.service
+Wants=zt-sangfor-daemon.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+User=kasm-user
+Group=kasm-user
+NoNewPrivileges=true
+OOMScoreAdjust=200
+Environment=HOME=/home/kasm-user
+Environment=USER=kasm-user
+Environment=LOGNAME=kasm-user
+Environment=DISPLAY=:1
+Environment=LANG=en_US.UTF-8
+WorkingDirectory=/home/kasm-user
+ExecStartPre=/bin/sh -c 'for _ in $(seq 60); do /usr/bin/xdpyinfo -display :1 >/dev/null 2>&1 && exit 0; sleep 0.5; done; echo "zt-sangfor-ui: display :1 not ready" >&2; exit 1'
+ExecStart=/usr/local/bin/zt-sangfor-ui.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=6
+StandardOutput=append:/var/log/zt-sangfor.log
+StandardError=append:/var/log/zt-sangfor.log
+
+[Install]
+WantedBy=multi-user.target

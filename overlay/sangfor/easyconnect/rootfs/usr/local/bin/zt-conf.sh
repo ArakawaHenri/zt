@@ -1,40 +1,46 @@
 #!/bin/bash
-# EasyConnect keeps its login state in ~/conf of whoever runs it.
-# zt-sangfor.service runs this script as kasm-user (never root) around each
-# session so symlinks inside kasm-user-owned directories cannot cross a
-# privilege boundary.
+# Prepare EasyConnect's persistent config directory (/usr/share/sangfor/EasyConnect/resources/conf).
+# zt-sangfor-daemon.service runs this script strictly as kasm-user (never root) so symlinks
+# inside the persisted directory cannot cross a privilege boundary.
 set -eu
 shopt -s nullglob
 res=/usr/share/sangfor/EasyConnect/resources
-home=/home/kasm-user
+conf="$res/conf"
+tmp_dir=
+
+# shellcheck disable=SC2329
+cleanup() {
+    if [ -n "$tmp_dir" ]; then
+        rm -rf -- "$tmp_dir"
+    fi
+}
+trap cleanup EXIT
 
 case ${1:-} in
 init)
-    mkdir -p "$home/conf" "$res/conf"
+    mkdir -p "$conf"
+    # Atomically seed any missing image defaults without overwriting user state or following symlinks.
     for f in "$res"/conf_backup/*; do
         base=$(basename "$f")
-        [ -e "$home/conf/$base" ] || cp -rP -- "$f" "$home/conf/$base"
+        if [ "$base" = "pkg_version.xml" ]; then
+            continue
+        fi
+        if [ -e "$conf/$base" ] || [ -L "$conf/$base" ]; then
+            continue
+        fi
+        tmp_dir=$(mktemp -d "$conf/.zt-seed.XXXXXX")
+        cp -rP -- "$f" "$tmp_dir/$base"
+        mv -n -- "$tmp_dir/$base" "$conf/$base" 2>/dev/null || true
+        rm -rf -- "$tmp_dir"
+        tmp_dir=
     done
-    rm -f "$home/conf/ECDomainFile"
-    for f in "$home"/conf/*; do
-        ln -sfn "$f" "$res/conf/$(basename "$f")"
-    done
+    # Remove stale Unix socket left by an unclean stop; never delete user configs or certificates.
+    rm -f -- "$conf/ECDomainFile"
     # Clients built for non-amd64 hosts cannot pass the vendor's version check.
-    ln -fsn /dev/null "$res/conf/pkg_version.xml"
-    ;;
-sync)
-    cd "$res/conf"
-    rm -f pkg_version.xml
-    for f in *; do
-        [ -r "$f" ] && [ ! -L "$f" ] && [ ECDomainFile != "$f" ] && cp -rP -- "$f" "$home/conf/"
-    done
-    cd "$home/conf"
-    for f in *; do
-        [ ! -e "$res/conf/$f" ] && rm -rf -- "$f"
-    done
+    ln -fsn /dev/null "$conf/pkg_version.xml"
     ;;
 *)
-    echo 'usage: zt-conf.sh init|sync' >&2
+    echo 'usage: zt-conf.sh init' >&2
     exit 2
     ;;
 esac

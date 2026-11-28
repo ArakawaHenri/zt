@@ -1,13 +1,22 @@
 """Output helpers, cross-platform paths, settings persistence, accept mode, and container env."""
 import hashlib
 import ipaddress
+import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-from zt.spec import ACCEPT_MODES, ENGINES, SETTINGS, host_arch
+from zt.spec import (
+    ACCEPT_MODES,
+    ENGINES,
+    SETTINGS,
+    desktop_backend_port,
+    desktop_port,
+    host_arch,
+)
 
 _LAN_NETWORKS = (
     ipaddress.ip_network('127.0.0.0/8'),
@@ -171,14 +180,80 @@ def state_dir():
     return _user_dir('XDG_STATE_HOME', '.local/state') / 'zt'
 
 
+def ensure_private_dir(path):
+    """Create `path` if missing and enforce 0700 permissions on POSIX."""
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    if not _is_windows():
+        os.chmod(directory, 0o700)
+    return directory
+
+
+def ensure_state_dir():
+    """Ensure `state_dir()` exists with 0700 permissions on POSIX."""
+    return ensure_private_dir(state_dir())
+
+
 def engine_file():
     return state_dir() / 'engine'
+
+
+def health_file(profile):
+    return state_dir() / f'health-{profile}.json'
+
+
+def identity_file(profile):
+    return state_dir() / f'identity-{profile}.json'
+
+
+_MAC_RE = re.compile(r'^02:7a:74:[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}$')
+
+
+def ensure_identity_mac(profile, engine_cli):
+    """Return a stable locally-administered MAC (02:7a:74:xx:xx:xx) for (profile, engine_cli)."""
+    path = identity_file(profile)
+    data = {}
+    try:
+        loaded = json.loads(path.read_text(encoding='utf-8'))
+        if isinstance(loaded, dict):
+            data = loaded
+    except (OSError, ValueError):
+        data = {}
+
+    macs = data.get('mac') if isinstance(data.get('mac'), dict) else {}
+    existing = macs.get(engine_cli)
+    if isinstance(existing, str) and _MAC_RE.fullmatch(existing):
+        return existing
+
+    raw = os.urandom(3)
+    mac = f'02:7a:74:{raw[0]:02x}:{raw[1]:02x}:{raw[2]:02x}'
+    macs = dict(macs)
+    macs[engine_cli] = mac
+    data['mac'] = macs
+    write_private_file(path, json.dumps(data, sort_keys=True, indent=2) + '\n')
+    return mac
+
+
+def vnc_internal_port(profile):
+    """Internal loopback port used by containers when fronted by the host bridge (`lan`/`all`)."""
+    return desktop_backend_port(profile)
+
+
+def container_desktop_port(profile, mode=None):
+    """Host loopback port published by the container for KasmVNC `:6901`."""
+    return desktop_port(profile) if (mode or accept_mode()) == 'local' else vnc_internal_port(profile)
+
+
+def container_publish_host(_mode=None):
+    """Container `:6901` always publishes on loopback; `lan`/`all` are fronted by `bridge.py`."""
+    return '127.0.0.1'
 
 
 def save_engine(choice):
     """Atomically persist the selected engine ('container' or 'docker') in engine_file()."""
     if choice not in ENGINES:
         die(f'engine must be one of: {", ".join(ENGINES)}')
+    ensure_state_dir()
     return _write_config_lines(engine_file(), [choice])
 
 
@@ -245,28 +320,36 @@ def setting(key):
     return settings.get(key, '')
 
 
-def _write_config_lines(path, lines):
-    """Atomically write `lines` to `path` with 0600 permissions on POSIX."""
-    payload = ''.join(f'{line}\n' for line in lines)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix='.config-', dir=path.parent)
+def write_private_file(path, text):
+    """Atomically write `text` to `path` with 0600 permissions on POSIX."""
+    target = Path(path)
+    if target.parent == state_dir():
+        ensure_state_dir()
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f'.{target.name}-', dir=target.parent)
     tmp = Path(tmp_name)
     fd_owned = True
     try:
-        if os.name != 'nt':
+        if not _is_windows():
             os.fchmod(fd, 0o600)
         fd_owned = False
         with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as handle:
-            handle.write(payload)
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        os.replace(tmp, target)
     except BaseException:
         if fd_owned:
             os.close(fd)
         tmp.unlink(missing_ok=True)
         raise
-    return path
+    return target
+
+
+def _write_config_lines(path, lines):
+    """Atomically write `lines` to `path` with 0600 permissions on POSIX."""
+    return write_private_file(path, ''.join(f'{line}\n' for line in lines))
 
 
 def write_setting(key, value):
@@ -318,13 +401,15 @@ def is_lan_ip(host):
     return any(ip in net for net in _LAN_NETWORKS)
 
 
+PASSWORD_MIN = 6
+PASSWORD_MAX = 128
+
+
 def password_valid(password):
     return (
-        6 <= len(password) <= 8
+        PASSWORD_MIN <= len(password) <= PASSWORD_MAX
+        and all(0x20 <= ord(ch) <= 0x7E for ch in password)
         and password.strip() == password
-        and '\n' not in password
-        and '\r' not in password
-        and bool(password)
         and password[0] not in '#"\''
         and parse_config(f'VNC_PW={password}\n').get('VNC_PW') == password
     )
@@ -341,14 +426,14 @@ def auth_password(mode=None):
     if not password:
         if mode == 'all':
             die(
-                'accept mode is "all" and requires a 6 to 8 character password; '
-                'run "zt password" first'
+                f'accept mode is "all" and requires a {PASSWORD_MIN} to {PASSWORD_MAX} '
+                'character password; run "zt password" first'
             )
         return ''
     if not password_valid(password):
         die(
-            'VNC_PW must be 6 to 8 characters without leading/trailing spaces, '
-            'newlines, or leading #, ", \'; run "zt password" to fix it'
+            f'VNC_PW must be {PASSWORD_MIN} to {PASSWORD_MAX} printable ASCII characters '
+            'without leading/trailing spaces or leading #, ", \'; run "zt password" to fix it'
         )
     return password
 

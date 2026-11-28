@@ -1,0 +1,88 @@
+#!/bin/bash
+# Safe unified xdg-open for all zt VPN clients (TrustAgent, aTrust, EasyConnect).
+# - Accepts only sanitized http:// or https:// URLs (<= 4096 bytes, no control/whitespace chars).
+# - Drops root privileges via setpriv before touching X11, clipboard, or /run/zt-events.
+# - Copies the URL to the X11 clipboard (synced by KasmVNC), emits a non-blocking
+#   desktop notification (never xmessage), and atomically writes /run/zt-events/latest.json.
+set -eu
+
+url=
+after_dd=0
+for arg in "$@"; do
+    if [ "$after_dd" -eq 0 ] && [ "$arg" = "--" ]; then
+        after_dd=1
+        continue
+    fi
+    if [ "$after_dd" -eq 0 ]; then
+        case "$arg" in
+            -*) continue ;;
+        esac
+    fi
+    case "$arg" in
+        http://*|https://*)
+            url=$arg
+            break
+            ;;
+    esac
+done
+
+if [ -z "$url" ] || [ "${#url}" -gt 4096 ]; then
+    echo 'zt xdg-open: rejected missing, non-http(s), or oversized URL' >&2
+    exit 1
+fi
+
+if ! /usr/bin/python3 -I -c '
+import re, sys
+url = sys.argv[1]
+ok = len(url) <= 4096 and bool(re.fullmatch(r"https?://[A-Za-z0-9._:%\[\]-]+(?:[/?#][!-~]*)?", url))
+sys.exit(0 if ok else 1)
+' "$url"; then
+    echo 'zt xdg-open: rejected malformed URL' >&2
+    exit 1
+fi
+
+if [ "$(id -u)" -eq 0 ]; then
+    exec /usr/bin/setpriv --reuid kasm-user --regid kasm-user --init-groups --no-new-privs \
+        /usr/bin/env HOME=/home/kasm-user USER=kasm-user LOGNAME=kasm-user DISPLAY="${DISPLAY:-:1}" \
+        /usr/bin/xdg-open -- "$url"
+fi
+
+export DISPLAY="${DISPLAY:-:1}"
+
+if command -v xclip >/dev/null 2>&1; then
+    printf '%s' "$url" | xclip -selection clipboard -i >/dev/null 2>&1 || true
+fi
+
+/usr/bin/python3 -I - "$url" <<'PY' || true
+import json
+import os
+import sys
+import tempfile
+import time
+
+url = sys.argv[1]
+events_dir = '/run/zt-events'
+if not os.path.isdir(events_dir):
+    sys.exit(0)
+fd, tmp = tempfile.mkstemp(prefix='.latest-', dir=events_dir)
+try:
+    os.fchmod(fd, 0o644)
+    with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+        json.dump({'kind': 'url', 'url': url, 'ts': int(time.time())}, handle, separators=(',', ':'))
+        handle.write('\n')
+        handle.flush()
+    os.replace(tmp, os.path.join(events_dir, 'latest.json'))
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
+PY
+
+if command -v notify-send >/dev/null 2>&1; then
+    host=$(/usr/bin/python3 -I -c 'import sys, urllib.parse; print(urllib.parse.urlsplit(sys.argv[1]).hostname or "SSO")' "$url" 2>/dev/null || echo "SSO")
+    notify-send -u normal -t 10000 "zt: SSO Link Copied" \
+        "Copied ${host} link to clipboard. Open in your host browser (local callback active 5m)." \
+        >/dev/null 2>&1 || true
+fi

@@ -7,6 +7,9 @@
   <item label="TrustAgent">
     <action name="Execute"><command>/opt/apps/com.qianxin.trustagent/files/bin/gui_start.sh</command></action>
   </item>
+  <item label="Enable Host SSO Callback (5m)">
+    <action name="Execute"><command>/bin/sh -c '/usr/bin/python3 -I -c "import json,os,tempfile,time; d=\"/run/zt-events\"; os.path.isdir(d) and (lambda fd,p: (os.fchmod(fd,0o644), (lambda f: (json.dump({\"kind\":\"callback\",\"ts\":int(time.time())},f,separators=(\",\",\":\")), f.write(\"\\n\"), f.close()))(os.fdopen(fd,\"w\",encoding=\"utf-8\")), os.replace(p,d+\"/latest.json\")))(*tempfile.mkstemp(prefix=\".latest-\",dir=d))"; command -v notify-send &gt;/dev/null 2&gt;&amp;1 &amp;&amp; notify-send -u normal -t 6000 "zt: Host SSO Callback" "Localhost SSO callback enabled for 5 minutes." || true'</command></action>
+  </item>
   <item label="Memo">
     <action name="Execute"><command>/usr/bin/mousepad memo.txt</command></action>
   </item>

@@ -1,11 +1,13 @@
 [Unit]
 Description=TrustAgent bypass route table setup
+Requires=zt-net.service
 Wants=network-online.target
 After=network-online.target zt-net.service
 
 [Service]
 Type=oneshot
 NoNewPrivileges=true
+CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_PTRACE
 PassEnvironment=BYPASS_ROUTES
 ExecStart=/usr/local/bin/zt-trustagent-routes.sh
 RemainAfterExit=yes

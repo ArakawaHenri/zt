@@ -1,5 +1,6 @@
-"""Multiplexed persistent SOCKS5 bridge (TCP + UDP ASSOCIATE) with accept-mode guard & RFC 1929 auth."""
+"""Multiplexed persistent SOCKS5 bridge (proto v3: native TCP + UDP + SSO callbacks + VNC guard)."""
 import asyncio
+import collections
 import contextlib
 import csv
 import hmac
@@ -15,26 +16,44 @@ import sys
 import time
 from pathlib import Path
 
+from zt import spec as zt_spec
 from zt.config import (
     accept_mode,
     auth_fingerprint,
     auth_password,
     bind_address,
     die,
+    ensure_state_dir,
+    health_file,
     is_lan_ip,
     say,
     state_dir,
     warn,
+    write_private_file,
 )
 from zt.guest.mux import (
     ATYP_DOMAIN,
     ATYP_IPV4,
     ATYP_IPV6,
+    CALLBACK_OPEN,
+    CALLBACK_REQ,
     DATA,
     EOF,
+    MAX_TCP_STREAMS,
+    MAX_UDP_ASSOCS,
     MAX_UDP_PAYLOAD,
-    OPEN,
+    OPEN_ERR,
+    OPEN_OK,
+    OPEN_URL,
+    PING,
+    PONG,
+    PORT_STRUCT,
+    REP_ATYP_NOT_SUPPORTED,
+    REP_CMD_NOT_SUPPORTED,
+    REP_GENERAL_FAILURE,
     RST,
+    STATIC_CALLBACK_ALLOWLIST,
+    TCP_OPEN,
     UDP_CLOSE,
     UDP_DATA,
     UDP_OPEN,
@@ -48,6 +67,7 @@ from zt.guest.mux import (
     normalize_ip,
     parse_socks_addr,
     read_frame,
+    sanitize_sso_url,
     send_stream_data,
     splice_tasks,
 )
@@ -61,8 +81,36 @@ from zt.spec import (
     socks_port,
 )
 
-MAX_UDP_ASSOCS = 128
-BRIDGE_PROTO = 2  # Bump whenever bridge/mux wire protocol gains capabilities (v1=TCP, v2=TCP+UDP)
+# Bump whenever bridge/mux wire protocol gains capabilities:
+#   v1 = TCP via microsocks
+#   v2 = TCP via microsocks + UDP ASSOCIATE
+#   v3 = Native GuestMux TCP CONNECT (no microsocks) + PING/HEALTH + SSO callbacks + accept-all VNC guard
+BRIDGE_PROTO = 3
+
+SOCKS_HANDSHAKE_TIMEOUT = 30.0
+TCP_OPEN_TIMEOUT = 20.0
+PIPE_WRITE_TIMEOUT = 10.0
+HEARTBEAT_INTERVAL = 15.0
+HEARTBEAT_TIMEOUT = 5.0
+BOOT_REFRESH_DELAYS = (3.0, 6.0)
+SLEEP_JUMP_THRESHOLD = 10.0
+CALLBACK_TTL_SECONDS = 300.0
+MAX_TRACKED_RATE_IPS = 4096
+
+_DEFAULT_CALLBACK_PORTS = {
+    'trustagent': (39301,),
+    'atrust': (54631,),
+    'easyconnect': (54530,),
+}
+
+
+def callback_ports_for(profile):
+    """Return allowed container loopback callback ports for `profile`."""
+    if not profile:
+        return ()
+    mapping = getattr(zt_spec, 'CALLBACK_PORTS', _DEFAULT_CALLBACK_PORTS)
+    ports = mapping.get(profile, ())
+    return tuple(sorted({int(p) for p in ports if int(p) in STATIC_CALLBACK_ALLOWLIST}))
 
 
 def bridge_pidfile(profile):
@@ -71,6 +119,104 @@ def bridge_pidfile(profile):
 
 def bridge_logfile(profile):
     return state_dir() / f'socks-{profile}.log'
+
+
+def _is_loopback_ip(host):
+    norm = normalize_ip(host)
+    if norm is None:
+        return False
+    return ipaddress.ip_address(norm).is_loopback
+
+
+class _ConnRateLimiter:
+    """Bounded per-source-IP sliding-window connection rate limiter (exempting loopback)."""
+
+    def __init__(self, max_hits=20, window=10.0, max_ips=MAX_TRACKED_RATE_IPS):
+        self._max_hits = max_hits
+        self._window = window
+        self._max_ips = max_ips
+        self._hits = collections.OrderedDict()
+
+    def allow(self, peer_ip, now=None):
+        norm = normalize_ip(peer_ip)
+        if not norm or _is_loopback_ip(norm):
+            return True
+        now = time.monotonic() if now is None else now
+        cutoff = now - self._window
+        dq = self._hits.get(norm)
+        if dq is None:
+            if len(self._hits) >= self._max_ips:
+                self._hits.popitem(last=False)
+            dq = collections.deque()
+            self._hits[norm] = dq
+        else:
+            self._hits.move_to_end(norm)
+            while dq and dq[0] <= cutoff:
+                dq.popleft()
+        if len(dq) >= self._max_hits:
+            return False
+        dq.append(now)
+        return True
+
+
+class _AuthFailureLimiter:
+    """Bounded per-source-IP RFC 1929 auth failure blocker (exempting loopback)."""
+
+    def __init__(self, max_failures=5, window=60.0, block_seconds=60.0, max_ips=MAX_TRACKED_RATE_IPS):
+        self._max_failures = max_failures
+        self._window = window
+        self._block_seconds = block_seconds
+        self._max_ips = max_ips
+        self._failures = collections.OrderedDict()
+        self._blocked_until = {}
+
+    def is_blocked(self, peer_ip, now=None):
+        norm = normalize_ip(peer_ip)
+        if not norm or _is_loopback_ip(norm):
+            return False
+        now = time.monotonic() if now is None else now
+        until = self._blocked_until.get(norm)
+        if until is None:
+            return False
+        if now >= until:
+            self._blocked_until.pop(norm, None)
+            return False
+        return True
+
+    def record_failure(self, peer_ip, now=None):
+        norm = normalize_ip(peer_ip)
+        if not norm or _is_loopback_ip(norm):
+            return
+        now = time.monotonic() if now is None else now
+        cutoff = now - self._window
+        dq = self._failures.get(norm)
+        if dq is None:
+            if len(self._failures) >= self._max_ips:
+                evicted, _ = self._failures.popitem(last=False)
+                self._blocked_until.pop(evicted, None)
+            dq = collections.deque()
+            self._failures[norm] = dq
+        else:
+            self._failures.move_to_end(norm)
+            while dq and dq[0] <= cutoff:
+                dq.popleft()
+        dq.append(now)
+        if len(dq) >= self._max_failures:
+            self._blocked_until[norm] = now + self._block_seconds
+
+    def record_success(self, peer_ip):
+        norm = normalize_ip(peer_ip)
+        if not norm:
+            return
+        self._failures.pop(norm, None)
+        self._blocked_until.pop(norm, None)
+
+
+def _check_sleep_jump(last_mono, last_wall, now_mono, now_wall, threshold=SLEEP_JUMP_THRESHOLD):
+    """True when host clock jumped (suspend/resume) across a heartbeat tick."""
+    mono_dt = now_mono - last_mono
+    wall_dt = now_wall - last_wall
+    return mono_dt > threshold or abs(wall_dt - mono_dt) > threshold
 
 
 def _recv_exact(conn, count):
@@ -84,11 +230,11 @@ def _recv_exact(conn, count):
 
 
 def socks_ready(port, auth=None, timeout=2.0):
-    """True when 127.0.0.1:port completes the expected SOCKS5 handshake.
+    """True when 127.0.0.1:port completes the expected SOCKS5 handshake end-to-end.
 
-    When `auth` is None (`accept local` / `lan`), checks unauthenticated greeting.
-    When `auth=(user, password)` (`accept all`), verifies no-auth is rejected
-    (0x05 0xff) AND RFC 1929 username/password succeeds (0x01 0x00).
+    When `auth` is None, checks unauthenticated greeting.
+    When `auth=(user, password)`, verifies no-auth is rejected (0x05 0xff)
+    AND RFC 1929 username/password succeeds (0x01 0x00, which requires live GuestMux).
     """
     try:
         if auth is None:
@@ -102,7 +248,7 @@ def socks_ready(port, auth=None, timeout=2.0):
             conn.sendall(b'\x05\x01\x00')
             if _recv_exact(conn, 2) != b'\x05\xff':
                 return False
-        # 2. Confirm RFC 1929 username/password succeeds end-to-end (including microsocks).
+        # 2. Confirm RFC 1929 username/password succeeds end-to-end (requiring live GuestMux).
         with socket.create_connection(('127.0.0.1', port), timeout=timeout) as conn:
             conn.sendall(b'\x05\x01\x02')
             if _recv_exact(conn, 2) != b'\x05\x02':
@@ -164,7 +310,7 @@ def _parse_pidfile(path):
 
 
 def _write_pidfile(profile, pid, engine_cli, mode='local', auth_hash='', proto=BRIDGE_PROTO):
-    state_dir().mkdir(parents=True, exist_ok=True)
+    ensure_state_dir()
     payload = json.dumps({
         'pid': pid,
         'engine': engine_cli,
@@ -173,7 +319,47 @@ def _write_pidfile(profile, pid, engine_cli, mode='local', auth_hash='', proto=B
         'auth_hash': auth_hash,
         'proto': proto,
     }) + '\n'
-    bridge_pidfile(profile).write_text(payload, encoding='utf-8')
+    write_private_file(bridge_pidfile(profile), payload)
+
+
+def _open_private_append(path):
+    """Open `path` for binary append with 0600 permissions on POSIX (refusing symlinks)."""
+    if os.name == 'nt':
+        return path.open('ab')
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, 'ab')
+
+
+def _enable_tcp_keepalive(sock, idle=60, interval=15, count=4):
+    """Best-effort cross-platform TCP keepalive so dead peers do not leak sockets/tasks."""
+    if sock is None:
+        return
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if os.name == 'nt' and hasattr(socket, 'SIO_KEEPALIVE_VALS'):
+        with contextlib.suppress(OSError, ValueError):
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle * 1000, interval * 1000))
+        return
+    keepidle = getattr(socket, 'TCP_KEEPIDLE', None)
+    if keepidle is None:
+        keepidle = getattr(socket, 'TCP_KEEPALIVE', None)
+    if keepidle is not None:
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.IPPROTO_TCP, keepidle, idle)
+    keepintvl = getattr(socket, 'TCP_KEEPINTVL', None)
+    if keepintvl is not None:
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.IPPROTO_TCP, keepintvl, interval)
+    keepcnt = getattr(socket, 'TCP_KEEPCNT', None)
+    if keepcnt is not None:
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.IPPROTO_TCP, keepcnt, count)
 
 
 def _pid_is_bridge_windows(pid, profile):
@@ -226,10 +412,13 @@ def _pid_is_bridge(pid, profile):
             return True
         except OSError:
             return False
-    proc = subprocess.run(
-        [ps, '-ww', '-p', str(pid), '-o', 'command='],
-        capture_output=True, text=True, check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [ps, '-ww', '-p', str(pid), '-o', 'command='],
+            capture_output=True, text=True, check=False, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     return proc.returncode == 0 and proc.stdout.split()[-2:] == ['bridge', profile]
 
 
@@ -285,14 +474,19 @@ def _detached_popen_kwargs():
     return {'start_new_session': True}
 
 
+def _needs_vnc_front_proxy(mode):
+    return mode in ('lan', 'all')
+
+
 def bridge_start(engine, profile, mode=None, wait_seconds=45.0):
-    """Start (or restart on accept/password change) the background multiplexed bridge."""
+    """Start (or auto-heal/restart) the background multiplexed bridge."""
     mode = mode or accept_mode()
     password = auth_password(mode)
     wanted_hash = auth_fingerprint(mode, password)
     auth = (AUTH_USER, password) if password else None
     bind_host = bind_address(mode)
     port = socks_port(profile)
+    vnc_fronted = _needs_vnc_front_proxy(mode)
 
     live_pid, live_engine, live_accept, live_hash, live_proto = bridge_record(profile)
     if live_pid:
@@ -303,14 +497,15 @@ def bridge_start(engine, profile, mode=None, wait_seconds=45.0):
                 f'not {engine.display_name}'
             )
         if bridge_matches(live_accept, live_hash, live_proto, mode, wanted_hash):
-            desktop_ok = True if mode != 'lan' else _port_listening(desktop_port(profile))
-            return (
-                None
-                if desktop_ok and socks_ready(port, auth=auth)
-                else f'the bridge started for it is up, but nothing answers on {bind_host}:{port}'
-            )
-        # Accept mode, password, or bridge protocol changed — restart cleanly (container stays up).
-        bridge_stop(profile, engine_cli=engine.cli)
+            desktop_ok = True if not vnc_fronted else _port_listening(desktop_port(profile))
+            if desktop_ok and socks_ready(port, auth=auth):
+                return None
+            # Auto-heal hung or half-dead bridge instead of refusing recovery.
+            warn(f'{profile}: restarting unresponsive bridge (pid {live_pid})')
+            bridge_stop(profile, engine_cli=engine.cli)
+        else:
+            # Accept mode, password, or bridge protocol changed — restart cleanly (container stays up).
+            bridge_stop(profile, engine_cli=engine.cli)
 
     if socks_any_listener(port):
         return (
@@ -319,15 +514,15 @@ def bridge_start(engine, profile, mode=None, wait_seconds=45.0):
             'it is not a bridge started by zt'
         )
 
-    if mode == 'lan' and _port_listening(desktop_port(profile)):
+    if vnc_fronted and _port_listening(desktop_port(profile)):
         dport = desktop_port(profile)
         return (
             f'something else answers on {bind_host}:{dport} '
             f'({engine.port_holders(dport) or "a listener this user cannot see"}); '
-            'cannot start the LAN desktop guard'
+            f'cannot start the {mode} desktop proxy'
         )
 
-    state_dir().mkdir(parents=True, exist_ok=True)
+    ensure_state_dir()
     cmd, base_env = _bridge_command(profile)
     child_env = dict(base_env if base_env is not None else os.environ)
     child_env['ZT_ENGINE'] = engine.cli
@@ -337,7 +532,7 @@ def bridge_start(engine, profile, mode=None, wait_seconds=45.0):
     else:
         child_env.pop('ZT_VNC_PW', None)
 
-    with bridge_logfile(profile).open('ab') as log:
+    with _open_private_append(bridge_logfile(profile)) as log:
         bridge = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
@@ -352,21 +547,29 @@ def bridge_start(engine, profile, mode=None, wait_seconds=45.0):
     while time.monotonic() < deadline:
         if bridge.poll() is not None:
             break
-        desktop_ok = True if mode != 'lan' else _port_listening(desktop_port(profile))
+        desktop_ok = True if not vnc_fronted else _port_listening(desktop_port(profile))
         if desktop_ok and socks_ready(port, auth=auth):
             return None
         time.sleep(0.25)
 
+    listening = _port_listening(port)
+    still_alive = bridge.poll() is None
+    if still_alive:
+        # Clean up newly spawned unresponsive bridge so no orphan leaks.
+        bridge_stop(profile, engine_cli=engine.cli)
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            bridge.wait(timeout=2.0)
+
     who = engine.port_holders(port) or 'a listener this user cannot see'
-    if bridge.poll() is not None and socks_any_listener(port):
+    if not still_alive and socks_any_listener(port):
         return (
             f'the bridge did not take {bind_host}:{port}, {who} answers there instead, '
             f'see {bridge_logfile(profile)}'
         )
-    if bridge.poll() is None and _port_listening(port):
+    if still_alive and listening:
         return (
-            f'the bridge is listening on {bind_host}:{port}, but microsocks inside '
-            f'{container_name(profile)} did not complete a SOCKS5 handshake in {int(wait_seconds)}s; '
+            f'the bridge listened on {bind_host}:{port}, but the guest mux inside '
+            f'{container_name(profile)} did not complete a handshake in {int(wait_seconds)}s; '
             f'see {bridge_logfile(profile)}'
         )
     return f'the bridge did not answer on {bind_host}:{port}, see {bridge_logfile(profile)}'
@@ -398,16 +601,17 @@ def bridge_stop(profile, engine_cli=None):
                 pass
     if engine_cli is None or bridge_record(profile)[1] in (None, engine_cli):
         bridge_pidfile(profile).unlink(missing_ok=True)
+        health_file(profile).unlink(missing_ok=True)
 
 
-async def _read_socks5_noauth(reader, writer):
+async def _read_socks5_noauth(reader, writer, timeout=SOCKS_HANDSHAKE_TIMEOUT):
     """Perform RFC 1928 method selection for unauthenticated (0x00) mode."""
     try:
-        header = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
+        header = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
         ver, nmethods = header[0], header[1]
         if ver != 0x05 or nmethods == 0:
             return False
-        methods = await asyncio.wait_for(reader.readexactly(nmethods), timeout=10.0)
+        methods = await asyncio.wait_for(reader.readexactly(nmethods), timeout=timeout)
         if 0x00 not in methods:
             writer.write(b'\x05\xff')
             await writer.drain()
@@ -417,17 +621,14 @@ async def _read_socks5_noauth(reader, writer):
         return False
 
 
-async def _read_socks5_credentials(reader, writer):
-    """Perform RFC 1928 method selection + read RFC 1929 (user, password) bytes.
-
-    Returns (uname_bytes, passwd_bytes) or None if client fails method negotiation.
-    """
+async def _read_socks5_credentials(reader, writer, timeout=SOCKS_HANDSHAKE_TIMEOUT):
+    """Perform RFC 1928 method selection + read RFC 1929 (user, password) bytes."""
     try:
-        header = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
+        header = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
         ver, nmethods = header[0], header[1]
         if ver != 0x05 or nmethods == 0:
             return None
-        methods = await asyncio.wait_for(reader.readexactly(nmethods), timeout=10.0)
+        methods = await asyncio.wait_for(reader.readexactly(nmethods), timeout=timeout)
         if 0x02 not in methods:
             writer.write(b'\x05\xff')
             await writer.drain()
@@ -435,39 +636,41 @@ async def _read_socks5_credentials(reader, writer):
         writer.write(b'\x05\x02')
         await writer.drain()
 
-        sub = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
+        sub = await asyncio.wait_for(reader.readexactly(2), timeout=timeout)
         if sub[0] != 0x01:
             writer.write(b'\x01\x01')
             await writer.drain()
             return None
-        uname = await asyncio.wait_for(reader.readexactly(sub[1]), timeout=10.0)
-        plen = (await asyncio.wait_for(reader.readexactly(1), timeout=10.0))[0]
-        passwd = await asyncio.wait_for(reader.readexactly(plen), timeout=10.0)
+        uname = await asyncio.wait_for(reader.readexactly(sub[1]), timeout=timeout)
+        plen = (await asyncio.wait_for(reader.readexactly(1), timeout=timeout))[0]
+        passwd = await asyncio.wait_for(reader.readexactly(plen), timeout=timeout)
         return uname, passwd
     except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
         return None
 
 
-async def _read_socks5_addr_port(reader, initial=b''):
-    """Read RFC 1928 ATYP+ADDR+PORT from `initial` buffer then `reader`."""
+async def _read_socks5_addr_port_raw(reader, initial=b'', timeout=SOCKS_HANDSHAKE_TIMEOUT):
+    """Read RFC 1928 ATYP+ADDR+PORT returning (atyp, host, port, raw_bytes) or None."""
     buf = bytearray(initial)
+    consumed = bytearray()
 
     async def take(count):
         if len(buf) < count:
             need = count - len(buf)
-            buf.extend(await asyncio.wait_for(reader.readexactly(need), timeout=10.0))
+            buf.extend(await asyncio.wait_for(reader.readexactly(need), timeout=timeout))
         out = bytes(buf[:count])
         del buf[:count]
+        consumed.extend(out)
         return out
 
     try:
         atyp = (await take(1))[0]
         if atyp == ATYP_IPV4:
             raw = await take(6)
-            return atyp, socket.inet_ntop(socket.AF_INET, raw[:4]), (raw[4] << 8) | raw[5]
+            return atyp, socket.inet_ntop(socket.AF_INET, raw[:4]), (raw[4] << 8) | raw[5], bytes(consumed)
         if atyp == ATYP_IPV6:
             raw = await take(18)
-            return atyp, socket.inet_ntop(socket.AF_INET6, raw[:16]), (raw[16] << 8) | raw[17]
+            return atyp, socket.inet_ntop(socket.AF_INET6, raw[:16]), (raw[16] << 8) | raw[17], bytes(consumed)
         if atyp == ATYP_DOMAIN:
             dlen = (await take(1))[0]
             if dlen == 0:
@@ -479,18 +682,28 @@ async def _read_socks5_addr_port(reader, initial=b''):
                 host = raw[:dlen].decode('utf-8')
             except UnicodeDecodeError:
                 return None
-            return atyp, host, (raw[dlen] << 8) | raw[dlen + 1]
-        return 'unsupported', None, 0
+            if not host or any(ch.isspace() for ch in host):
+                return None
+            return atyp, host, (raw[dlen] << 8) | raw[dlen + 1], bytes(consumed)
+        return 'unsupported', None, 0, bytes(consumed)
     except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError, OSError):
         return None
+
+
+async def _read_socks5_addr_port(reader, initial=b'', timeout=SOCKS_HANDSHAKE_TIMEOUT):
+    """Read RFC 1928 ATYP+ADDR+PORT returning (atyp, host, port) or None."""
+    parsed = await _read_socks5_addr_port_raw(reader, initial=initial, timeout=timeout)
+    if parsed is None:
+        return None
+    return parsed[0], parsed[1], parsed[2]
 
 
 def _socks5_reply(rep, host='0.0.0.0', port=0):
     return b'\x05' + bytes([rep, 0x00]) + encode_socks_addr(host, port)
 
 
-def _bind_udp_socket(local_ip):
-    """Bind a non-blocking host UDP relay socket on `local_ip:0` (Windows-safe)."""
+def _bind_udp_socket(local_ip, scope_id=0):
+    """Bind a non-blocking host UDP relay socket on `local_ip:0` (Windows & IPv6 link-local safe)."""
     ip = ipaddress.ip_address(local_ip)
     family = socket.AF_INET6 if isinstance(ip, ipaddress.IPv6Address) else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_DGRAM)
@@ -502,11 +715,47 @@ def _bind_udp_socket(local_ip):
         if os.name == 'nt' and hasattr(socket, 'SIO_UDP_CONNRESET'):
             with contextlib.suppress(OSError, ValueError):
                 sock.ioctl(socket.SIO_UDP_CONNRESET, False)
-        sock.bind((local_ip, 0))
+        if family == socket.AF_INET6 and ip.is_link_local and scope_id:
+            sock.bind((local_ip, 0, 0, scope_id))
+        else:
+            sock.bind((local_ip, 0))
     except BaseException:
         sock.close()
         raise
     return sock
+
+
+async def _start_dual_stack_servers(handler, bind_host, port):
+    """Start primary IPv4 TCP server plus best-effort companion IPv6 (IPV6_V6ONLY) listener.
+
+    On IPv4-only hosts (or when IPv6 address is unavailable), falls back silently to IPv4
+    without leaking sockets or raising warnings.
+    """
+    primary = await asyncio.start_server(handler, bind_host, port)
+    servers = [primary]
+    v6_host = '::1' if bind_host == '127.0.0.1' else ('::' if bind_host == '0.0.0.0' else None)
+    if v6_host is None or not getattr(socket, 'has_ipv6', False):
+        return servers
+    v6_sock = None
+    try:
+        v6_sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        v6_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        v6_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        v6_sock.bind((v6_host, port))
+        v6_sock.setblocking(False)
+        v6_srv = await asyncio.start_server(handler, sock=v6_sock)
+        v6_sock = None  # Ownership transferred to asyncio Server.
+        servers.append(v6_srv)
+    except OSError:
+        if v6_sock is not None:
+            v6_sock.close()
+    except BaseException:
+        if v6_sock is not None:
+            v6_sock.close()
+        primary.close()
+        await primary.wait_closed()
+        raise
+    return servers
 
 
 class _HostUDPProtocol(asyncio.DatagramProtocol):
@@ -544,53 +793,450 @@ class _HostUDPProtocol(asyncio.DatagramProtocol):
 
 
 class HostMuxTunnel:
-    """Single persistent `CLI exec ... python3 -c <mux>` tunnel multiplexing TCP + UDP."""
+    """Single persistent `CLI exec ... python3 -c <mux>` tunnel multiplexing TCP + UDP + callbacks."""
 
-    def __init__(self, engine, name, auth=None, mux_source=None):
+    def __init__(
+        self,
+        engine,
+        name,
+        auth=None,
+        mux_source=None,
+        profile=None,
+        callback_ports=None,
+        heartbeat_interval=HEARTBEAT_INTERVAL,
+        heartbeat_timeout=HEARTBEAT_TIMEOUT,
+        boot_refresh_delays=BOOT_REFRESH_DELAYS,
+        callback_ttl=CALLBACK_TTL_SECONDS,
+        max_tcp_streams=MAX_TCP_STREAMS,
+        auth_limiter=None,
+        health_path=None,
+    ):
         self.engine = engine
         self.name = name
-        self.auth = auth  # None (local/lan) or (username, password) (all)
+        self.profile = profile
+        self.auth = auth  # None or (username, password)
         self._mux_source = mux_source if mux_source is not None else guest_script('mux')
+        raw_cb = callback_ports_for(profile) if callback_ports is None else callback_ports
+        self.callback_ports = tuple(sorted({
+            int(p) for p in raw_cb if int(p) in STATIC_CALLBACK_ALLOWLIST
+        }))
+        self._heartbeat_interval = heartbeat_interval
+        self._heartbeat_timeout = heartbeat_timeout
+        self._boot_refresh_delays = tuple(sorted(d for d in (boot_refresh_delays or ()) if d > 0))
+        self._callback_ttl = callback_ttl
+        self._max_tcp_streams = max_tcp_streams
+        self._auth_limiter = auth_limiter if auth_limiter is not None else _AuthFailureLimiter()
+        self._health_path = health_path
+
         self._process = None
+        self._epoch = 0
+        self._connected_at = 0.0
+        self._active_procs = set()
+        self._bg_tasks = set()
         self._reader_task = None
         self._stderr_task = None
+        self._heartbeat_task = None
         self._connect_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
+        self._ping_lock = asyncio.Lock()
+        self._pong_waiter = None
         self._streams = {}
+        self._pending_opens = {}
         self._udp_handlers = {}
         self._next_id = 1
         self._closing = False
+
+        self._backoff = 0.0
+        self._next_connect_after = 0.0
+        self._last_health = None
+        self._sso_url = ''
+        self._sso_ts = 0
+        self._callback_servers = {}
+        self._callback_until = 0.0
+        self._callback_timer = None
+        self._callback_conns = set()
 
     def _alloc_id(self):
         for _ in range(10000):
             sid = self._next_id
             self._next_id = (self._next_id % 0x7FFFFFFF) + 1
-            if sid not in self._streams and sid not in self._udp_handlers:
+            if (
+                sid not in self._streams
+                and sid not in self._pending_opens
+                and sid not in self._udp_handlers
+            ):
                 return sid
         raise RuntimeError('exhausted stream ids')
 
     async def _spawn_process(self):
-        return await asyncio.create_subprocess_exec(
+        cmd = [
             self.engine.cli, 'exec', '--interactive', '--user', 'nobody', self.name,
-            '/usr/bin/python3', '-c', self._mux_source, '127.0.0.1', '1080',
+            '/usr/bin/python3', '-c', self._mux_source,
+        ]
+        if self.profile:
+            cmd += ['--profile', self.profile]
+        if self.callback_ports:
+            cmd += ['--callback-ports', ','.join(str(p) for p in self.callback_ports)]
+        return await asyncio.create_subprocess_exec(
+            *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
+    async def _reap_process(self, proc, force=False):
+        """Close stdin, terminate/kill if still running, and await wait() so no zombie leaks."""
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None and not proc.stdin.is_closing():
+                with contextlib.suppress(OSError):
+                    proc.stdin.close()
+            if proc.returncode is None:
+                if force:
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    with contextlib.suppress(ProcessLookupError, OSError):
+                        proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        with contextlib.suppress(ProcessLookupError, OSError):
+                            proc.kill()
+                        with contextlib.suppress(ProcessLookupError, OSError):
+                            await proc.wait()
+            else:
+                with contextlib.suppress(ProcessLookupError, OSError):
+                    await proc.wait()
+        finally:
+            if proc.returncode is not None:
+                self._active_procs.discard(proc)
+
+    def _track_bg(self, coro):
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
+    def _schedule_send_if_open(self, stream_id, kind, payload=b'', proc=None):
+        """Schedule a non-blocking teardown frame while tracking the task to prevent leaks."""
+        self._track_bg(self.send_if_open(stream_id, kind, payload, proc=proc))
+
+    def _fail_waiters(self, reason='mux tunnel closed'):
+        for fut in list(self._pending_opens.values()):
+            if not fut.done():
+                fut.set_result((RST, b''))
+        self._pending_opens.clear()
+        waiter = self._pong_waiter
+        self._pong_waiter = None
+        if waiter is not None and not waiter.done():
+            waiter.set_exception(ConnectionError(reason))
+
+    async def _reset_tunnel(self, proc):
+        if proc is None:
+            return
+        if self._process is proc:
+            self._process = None
+        for state in list(self._streams.values()):
+            state.close_rst()
+        for _, on_close in list(self._udp_handlers.values()):
+            on_close()
+        self._fail_waiters('mux tunnel reset')
+        await self._reap_process(proc, force=True)
+
     async def ensure_connected(self):
-        if self._process is not None and self._process.returncode is None:
-            return self._process
+        proc = self._process
+        if proc is not None and proc.returncode is None:
+            return proc
         async with self._connect_lock:
-            if self._process is not None and self._process.returncode is None:
-                return self._process
+            proc = self._process
+            if proc is not None and proc.returncode is None:
+                return proc
             if self._closing:
                 raise ConnectionError('bridge is shutting down')
+            now = time.monotonic()
+            if now < self._next_connect_after:
+                raise ConnectionError('mux reconnect backing off')
             proc = await self._spawn_process()
             self._process = proc
-            self._reader_task = asyncio.create_task(self._read_loop(proc))
-            self._stderr_task = asyncio.create_task(self._drain_stderr(proc))
+            self._active_procs.add(proc)
+            stderr_task = asyncio.create_task(self._drain_stderr(proc))
+            self._stderr_task = stderr_task
+            self._reader_task = asyncio.create_task(self._read_loop(proc, stderr_task))
+            try:
+                await self.ping(proc=proc, timeout=self._heartbeat_timeout)
+            except (ConnectionError, OSError, asyncio.TimeoutError):
+                await self._reset_tunnel(proc)
+                self._backoff = min(2.0, self._backoff * 2.0 if self._backoff else 0.25)
+                self._next_connect_after = time.monotonic() + self._backoff
+                raise ConnectionError('guest mux did not answer PING')
+            self._epoch += 1
+            self._connected_at = time.monotonic()
+            self._backoff = 0.0
+            self._next_connect_after = 0.0
             return proc
+
+    async def ping(self, proc=None, timeout=None):
+        """Send a PING frame on `proc` and await its PONG health response."""
+        target = proc if proc is not None else self._process
+        if target is None or target.returncode is not None:
+            raise ConnectionError('mux tunnel closed')
+        timeout = self._heartbeat_timeout if timeout is None else timeout
+        async with self._ping_lock:
+            if self._process is not target or target.returncode is not None:
+                raise ConnectionError('mux tunnel closed')
+            loop = asyncio.get_running_loop()
+            waiter = loop.create_future()
+            self._pong_waiter = waiter
+            try:
+                await self.send_on(target, 0, PING)
+                return await asyncio.wait_for(waiter, timeout=timeout)
+            finally:
+                if self._pong_waiter is waiter:
+                    self._pong_waiter = None
+
+    def _resolved_health_path(self):
+        if self._health_path is not None:
+            return Path(self._health_path)
+        if self.profile:
+            return health_file(self.profile)
+        return None
+
+    def _persist_health(self, guest_data=None):
+        path = self._resolved_health_path()
+        now = int(time.time())
+        record = dict(self._last_health or {})
+        if isinstance(guest_data, dict):
+            record.update(guest_data)
+        if self._sso_url and (now - self._sso_ts) <= 300:
+            if record.get('vpn') != 'connected':
+                record['sso_url'] = self._sso_url
+                record['sso_ts'] = self._sso_ts
+                if record.get('vpn') in (None, '', 'disconnected'):
+                    record['vpn'] = 'sso-pending'
+            else:
+                self._sso_url = ''
+                self._sso_ts = 0
+                record.pop('sso_url', None)
+                record.pop('sso_ts', None)
+        elif self._sso_url:
+            self._sso_url = ''
+            self._sso_ts = 0
+            record.pop('sso_url', None)
+            record.pop('sso_ts', None)
+
+        record['updated_at'] = now
+        record['bridge_pid'] = os.getpid()
+        if self._callback_until > time.monotonic() and self._callback_servers:
+            record['callback_ports'] = sorted(self._callback_servers)
+            record['callback_until'] = int(time.time() + max(0.0, self._callback_until - time.monotonic()))
+        else:
+            record.pop('callback_ports', None)
+            record.pop('callback_until', None)
+
+        self._last_health = record
+        if path is not None:
+            with contextlib.suppress(OSError):
+                write_private_file(path, json.dumps(record, sort_keys=True) + '\n')
+
+    def _on_pong(self, payload):
+        parsed = {}
+        if payload:
+            try:
+                data = json.loads(payload.decode('utf-8'))
+                if isinstance(data, dict):
+                    parsed = data
+            except (UnicodeDecodeError, ValueError):
+                parsed = {}
+        self._persist_health(parsed)
+        waiter = self._pong_waiter
+        if waiter is not None and not waiter.done():
+            waiter.set_result(self._last_health)
+
+    def _on_open_url(self, payload):
+        try:
+            data = json.loads(payload.decode('utf-8'))
+        except (UnicodeDecodeError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        url = sanitize_sso_url(data.get('url'))
+        if not url:
+            return
+        self._sso_url = url
+        self._sso_ts = int(data.get('ts') or int(time.time()))
+        # NEVER auto-launch a host browser; record URL for `zt status` and arm loopback callbacks.
+        self._persist_health()
+        if self.callback_ports and not self._closing:
+            self._track_bg(self.arm_callbacks())
+
+    def _on_callback_req(self):
+        if self.callback_ports and not self._closing:
+            self._track_bg(self.arm_callbacks())
+
+    async def arm_callbacks(self, ttl=None):
+        """Bind host 127.0.0.1:<cb_port> on demand for `ttl` seconds (never 0.0.0.0)."""
+        if self._closing or not self.callback_ports:
+            return ()
+        ttl = self._callback_ttl if ttl is None else float(ttl)
+        self._callback_until = max(self._callback_until, time.monotonic() + ttl)
+        bound = []
+        for cb_port in self.callback_ports:
+            if cb_port in self._callback_servers:
+                bound.append(cb_port)
+                continue
+            try:
+                srv = await asyncio.start_server(
+                    lambda r, w, p=cb_port: self._accept_callback(p, r, w),
+                    '127.0.0.1',
+                    cb_port,
+                )
+            except OSError as exc:
+                warn(
+                    f'bridge({self.name}): cannot bind SSO callback 127.0.0.1:{cb_port} '
+                    f'({exc.strerror or exc}); SOCKS5 remains active'
+                )
+                continue
+            self._callback_servers[cb_port] = srv
+            bound.append(cb_port)
+            say(f'SSO callback 127.0.0.1:{cb_port} -> {self.name} (loopback only, {int(ttl)}s TTL)')
+
+        if self._callback_timer is not None and not self._callback_timer.done():
+            self._callback_timer.cancel()
+        if self._callback_servers:
+            self._callback_timer = self._track_bg(self._callback_expiry_loop())
+        self._persist_health()
+        return tuple(bound)
+
+    async def _callback_expiry_loop(self):
+        try:
+            while True:
+                remaining = self._callback_until - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(remaining, 10.0))
+        except asyncio.CancelledError:
+            return
+        await self._close_callback_servers()
+        self._persist_health()
+
+    async def _close_callback_servers(self):
+        servers = list(self._callback_servers.values())
+        self._callback_servers.clear()
+        self._callback_until = 0.0
+        for srv in servers:
+            srv.close()
+        for srv in servers:
+            with contextlib.suppress(OSError):
+                await srv.wait_closed()
+
+    async def _accept_callback(self, cb_port, reader, writer):
+        task = asyncio.current_task()
+        self._callback_conns.add(task)
+        try:
+            await self._handle_callback_client(cb_port, reader, writer)
+        finally:
+            self._callback_conns.discard(task)
+
+    async def _handle_callback_client(self, cb_port, reader, writer):
+        stream_id = None
+        bound_proc = None
+        opened = False
+        _enable_tcp_keepalive(writer.get_extra_info('socket'))
+        try:
+            if cb_port not in self.callback_ports or len(self._streams) >= self._max_tcp_streams:
+                return
+            bound_proc = await self.ensure_connected()
+            stream_id = self._alloc_id()
+            state = StreamState()
+            open_fut = asyncio.get_running_loop().create_future()
+            self._streams[stream_id] = state
+            self._pending_opens[stream_id] = open_fut
+            await self.send_on(bound_proc, stream_id, CALLBACK_OPEN, PORT_STRUCT.pack(cb_port))
+            kind, _payload = await asyncio.wait_for(open_fut, timeout=10.0)
+            if kind != OPEN_OK:
+                return
+            opened = True
+            await self._splice_host_stream(bound_proc, stream_id, state, reader, writer)
+        except (ConnectionError, OSError, asyncio.TimeoutError, asyncio.CancelledError):
+            if opened and stream_id is not None:
+                await self.send_if_open(stream_id, RST, proc=bound_proc)
+        finally:
+            if stream_id is not None:
+                self._pending_opens.pop(stream_id, None)
+                self._streams.pop(stream_id, None)
+            writer.close()
+            with contextlib.suppress(ConnectionError, OSError):
+                await writer.wait_closed()
+
+    def start_heartbeat(self):
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        return self._heartbeat_task
+
+    async def _heartbeat_loop(self):
+        last_mono = time.monotonic()
+        last_wall = time.time()
+        last_ping = last_mono
+        seen_epoch = self._epoch
+        pending_boot_delays = list(self._boot_refresh_delays) if self._process is not None else []
+        min_period = min(
+            (self._heartbeat_interval, *(self._boot_refresh_delays or (self._heartbeat_interval,))),
+        )
+        tick = min(1.0, max(0.05, min_period / 2.0))
+        try:
+            while not self._closing:
+                await asyncio.sleep(tick)
+                now_mono = time.monotonic()
+                now_wall = time.time()
+                woke = _check_sleep_jump(last_mono, last_wall, now_mono, now_wall)
+                last_mono = now_mono
+                last_wall = now_wall
+
+                if self._epoch != seen_epoch:
+                    seen_epoch = self._epoch
+                    pending_boot_delays = list(self._boot_refresh_delays) if self._process is not None else []
+                    last_ping = self._connected_at or now_mono
+
+                # Fast post-start health refresh (e.g. ~3s and ~6s) while container services settle.
+                boot_due = False
+                if pending_boot_delays and self._process is not None:
+                    cur_vpn = (self._last_health or {}).get('vpn')
+                    if cur_vpn in ('connected', 'sso-pending'):
+                        pending_boot_delays.clear()
+                    elif (now_mono - self._connected_at) >= pending_boot_delays[0]:
+                        pending_boot_delays.pop(0)
+                        boot_due = True
+
+                due = (now_mono - last_ping) >= self._heartbeat_interval
+                if not woke and not due and not boot_due:
+                    continue
+                proc = self._process
+                if proc is None:
+                    if woke:
+                        self._backoff = 0.0
+                        self._next_connect_after = 0.0
+                        with contextlib.suppress(ConnectionError, OSError):
+                            await self.ensure_connected()
+                        last_ping = time.monotonic()
+                    continue
+                last_ping = now_mono
+                try:
+                    await self.ping(proc=proc, timeout=self._heartbeat_timeout)
+                except (ConnectionError, OSError, asyncio.TimeoutError):
+                    reason = 'host sleep-wake' if woke else 'heartbeat timeout'
+                    warn(f'bridge({self.name}): {reason}; resetting mux tunnel')
+                    await self._reset_tunnel(proc)
+                    self._backoff = 0.0
+                    self._next_connect_after = 0.0
+                    if not self._closing:
+                        with contextlib.suppress(ConnectionError, OSError):
+                            await self.ensure_connected()
+        except asyncio.CancelledError:
+            return
 
     async def _drain_stderr(self, proc):
         try:
@@ -604,13 +1250,28 @@ class HostMuxTunnel:
         except (OSError, asyncio.CancelledError):
             pass
 
-    async def _read_loop(self, proc):
+    async def _read_loop(self, proc, stderr_task=None):
+        protocol_error = False
         try:
             while True:
                 frame = await read_frame(proc.stdout)
                 if frame is None:
                     break
                 stream_id, kind, payload = frame
+                if kind == PONG:
+                    self._on_pong(payload)
+                    continue
+                if kind == OPEN_URL:
+                    self._on_open_url(payload)
+                    continue
+                if kind == CALLBACK_REQ:
+                    self._on_callback_req()
+                    continue
+                if kind in (OPEN_OK, OPEN_ERR):
+                    fut = self._pending_opens.pop(stream_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result((kind, payload))
+                    continue
                 if kind == UDP_DATA:
                     handler = self._udp_handlers.get(stream_id)
                     if handler is not None:
@@ -631,7 +1292,7 @@ class HostMuxTunnel:
                     if not state.push_data(payload):
                         # Peer violated stream window cap: RST only this stream, never stall demux.
                         self._streams.pop(stream_id, None)
-                        asyncio.create_task(self.send_if_open(stream_id, RST))
+                        self._schedule_send_if_open(stream_id, RST, proc=proc)
                 elif kind == EOF:
                     state.push_eof()
                 elif kind == WINDOW_UPDATE:
@@ -639,7 +1300,12 @@ class HostMuxTunnel:
                         state.add_window(WIN_STRUCT.unpack(payload)[0])
                 elif kind == RST:
                     state.close_rst()
-        except (OSError, ValueError, asyncio.CancelledError):
+        except ValueError as exc:
+            protocol_error = True
+            warn(f'bridge({self.name}): mux protocol desync ({exc}); resetting tunnel')
+        except OSError:
+            protocol_error = True
+        except asyncio.CancelledError:
             pass
         finally:
             if self._process is proc:
@@ -648,54 +1314,116 @@ class HostMuxTunnel:
                 state.close_rst()
             for _, on_close in list(self._udp_handlers.values()):
                 on_close()
+            self._fail_waiters('mux tunnel closed')
+            if not self._closing:
+                await self._reap_process(proc, force=protocol_error)
+                if stderr_task is not None and not stderr_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(stderr_task), timeout=1.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError, OSError):
+                        stderr_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, OSError):
+                            await stderr_task
+
+    async def send_on(self, proc, stream_id, kind, payload=b''):
+        """Send a frame strictly on `proc` (never respawning a new tunnel mid-stream)."""
+        if (
+            proc is None
+            or self._process is not proc
+            or proc.returncode is not None
+            or proc.stdin is None
+            or proc.stdin.is_closing()
+        ):
+            raise ConnectionError('mux tunnel closed')
+        frame = encode_frame(stream_id, kind, payload)
+        async with self._write_lock:
+            if (
+                self._process is not proc
+                or proc.returncode is not None
+                or proc.stdin is None
+                or proc.stdin.is_closing()
+            ):
+                raise ConnectionError('mux tunnel closed')
+            proc.stdin.write(frame)
+            try:
+                await asyncio.wait_for(proc.stdin.drain(), timeout=PIPE_WRITE_TIMEOUT)
+            except asyncio.TimeoutError:
+                self._track_bg(self._reset_tunnel(proc))
+                raise ConnectionError('mux tunnel write timed out')
 
     async def send(self, stream_id, kind, payload=b''):
         proc = await self.ensure_connected()
-        frame = encode_frame(stream_id, kind, payload)
-        async with self._write_lock:
-            if proc.returncode is not None or proc.stdin.is_closing():
-                raise ConnectionError('mux tunnel closed')
-            proc.stdin.write(frame)
-            await proc.stdin.drain()
+        await self.send_on(proc, stream_id, kind, payload)
 
-    async def send_if_open(self, stream_id, kind, payload=b''):
-        """Send a teardown frame only when the mux process is already live (never respawn)."""
-        proc = self._process
-        if proc is None or proc.returncode is not None or proc.stdin is None or proc.stdin.is_closing():
+    async def send_if_open(self, stream_id, kind, payload=b'', proc=None):
+        """Send a teardown frame only when the bound mux process is still live (never respawn)."""
+        target = self._process if proc is None else proc
+        if (
+            target is None
+            or self._process is not target
+            or target.returncode is not None
+            or target.stdin is None
+            or target.stdin.is_closing()
+        ):
             return
         frame = encode_frame(stream_id, kind, payload)
-        async with self._write_lock:
-            if proc.returncode is not None or proc.stdin.is_closing():
-                return
-            proc.stdin.write(frame)
-            await proc.stdin.drain()
-
-    async def _complete_guest_noauth(self, stream_id, state):
-        """Send no-auth greeting to guest microsocks and absorb its 2-byte reply."""
-        if not await send_stream_data(self.send, stream_id, state, b'\x05\x01\x00'):
-            return None
-        buf = bytearray()
-        while len(buf) < 2:
-            kind, payload = await asyncio.wait_for(state.recv(), timeout=5.0)
-            if kind != DATA:
-                return None
-            buf.extend(payload)
-        if bytes(buf[:2]) != b'\x05\x00':
-            return None
-        return bytes(buf[2:])
-
-    async def _handle_udp_associate(self, reader, writer, initial=b''):
-        req = await _read_socks5_addr_port(reader, initial=initial)
-        if req is None:
+        try:
+            async with self._write_lock:
+                if (
+                    self._process is not target
+                    or target.returncode is not None
+                    or target.stdin is None
+                    or target.stdin.is_closing()
+                ):
+                    return
+                target.stdin.write(frame)
+                await asyncio.wait_for(target.stdin.drain(), timeout=PIPE_WRITE_TIMEOUT)
+        except (BrokenPipeError, ConnectionError, OSError, asyncio.TimeoutError):
             return
-        atyp, req_host, req_port = req
+
+    async def _splice_host_stream(self, bound_proc, stream_id, state, reader, writer):
+        async def send_bound(sid, kind, data=b''):
+            await self.send_on(bound_proc, sid, kind, data)
+
+        async def host_to_guest():
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    await self.send_on(bound_proc, stream_id, EOF)
+                    return
+                if not await send_stream_data(send_bound, stream_id, state, data):
+                    return
+
+        async def guest_to_host():
+            pending_win = 0
+            while True:
+                kind, payload = await state.recv()
+                if kind == DATA:
+                    writer.write(payload)
+                    await writer.drain()
+                    pending_win += len(payload)
+                    if pending_win >= WINDOW_REPLENISH:
+                        inc = pending_win
+                        pending_win = 0
+                        await self.send_on(bound_proc, stream_id, WINDOW_UPDATE, WIN_STRUCT.pack(inc))
+                elif kind == EOF:
+                    if writer.can_write_eof():
+                        with contextlib.suppress(ConnectionError, OSError):
+                            writer.write_eof()
+                    return
+                elif kind == RST:
+                    return
+
+        await splice_tasks(host_to_guest(), guest_to_host(), drain_timeout=300)
+
+    async def _handle_udp_associate(self, bound_proc, reader, writer, atyp, req_host, req_port):
         if atyp == 'unsupported':
-            writer.write(_socks5_reply(0x08))
+            writer.write(_socks5_reply(REP_ATYP_NOT_SUPPORTED))
             await writer.drain()
             return
 
         if len(self._udp_handlers) >= MAX_UDP_ASSOCS:
-            writer.write(_socks5_reply(0x01))
+            writer.write(_socks5_reply(REP_GENERAL_FAILURE))
             await writer.drain()
             return
 
@@ -704,7 +1432,7 @@ class HostMuxTunnel:
         local_ip = normalize_ip(sockname[0]) if sockname else None
         peer_ip = normalize_ip(peername[0]) if peername else None
         if not local_ip or not peer_ip:
-            writer.write(_socks5_reply(0x01))
+            writer.write(_socks5_reply(REP_GENERAL_FAILURE))
             await writer.drain()
             return
 
@@ -728,7 +1456,8 @@ class HostMuxTunnel:
             def set_client_addr(addr):
                 client_addr[0] = addr
 
-            sock = _bind_udp_socket(local_ip)
+            scope_id = sockname[3] if (sockname and len(sockname) >= 4) else 0
+            sock = _bind_udp_socket(local_ip, scope_id=scope_id)
             bound_port = sock.getsockname()[1]
             try:
                 udp_transport, _ = await loop.create_datagram_endpoint(
@@ -751,21 +1480,18 @@ class HostMuxTunnel:
 
             udp_sid = self._alloc_id()
             self._udp_handlers[udp_sid] = (on_guest_datagram, on_tunnel_close)
-            await self.send(udp_sid, UDP_OPEN)
+            await self.send_on(bound_proc, udp_sid, UDP_OPEN)
             opened_udp = True
 
             writer.write(_socks5_reply(0x00, local_ip, bound_port))
             await writer.drain()
 
-            ctrl_sock = writer.get_extra_info('socket')
-            if ctrl_sock is not None:
-                with contextlib.suppress(OSError):
-                    ctrl_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            _enable_tcp_keepalive(writer.get_extra_info('socket'))
 
             async def tx_pump():
                 while True:
                     body = await tx_queue.get()
-                    await self.send(udp_sid, UDP_DATA, body)
+                    await self.send_on(bound_proc, udp_sid, UDP_DATA, body)
 
             async def watch_tcp_control():
                 while await reader.read(1024):
@@ -787,7 +1513,7 @@ class HostMuxTunnel:
         except OSError:
             if not opened_udp:
                 with contextlib.suppress(ConnectionError, OSError):
-                    writer.write(_socks5_reply(0x01))
+                    writer.write(_socks5_reply(REP_GENERAL_FAILURE))
                     await writer.drain()
         finally:
             for task in tasks:
@@ -801,13 +1527,19 @@ class HostMuxTunnel:
                 self._udp_handlers.pop(udp_sid, None)
             if opened_udp and udp_sid is not None:
                 with contextlib.suppress(ConnectionError, OSError):
-                    await self.send_if_open(udp_sid, UDP_CLOSE)
+                    await self.send_if_open(udp_sid, UDP_CLOSE, proc=bound_proc)
 
     async def handle_client(self, reader, writer):
         stream_id = None
+        bound_proc = None
         opened = False
+        _enable_tcp_keepalive(writer.get_extra_info('socket'))
+        peername = writer.get_extra_info('peername')
+        peer_ip = peername[0] if peername else None
         try:
             if self.auth is not None:
+                if self._auth_limiter.is_blocked(peer_ip):
+                    return
                 creds = await _read_socks5_credentials(reader, writer)
                 if creds is None:
                     return
@@ -818,95 +1550,86 @@ class HostMuxTunnel:
                     and hmac.compare_digest(passwd, want_p.encode('utf-8'))
                 )
                 if not valid:
+                    self._auth_limiter.record_failure(peer_ip)
                     writer.write(b'\x01\x01')
                     await writer.drain()
                     return
+                self._auth_limiter.record_success(peer_ip)
             else:
                 if not await _read_socks5_noauth(reader, writer):
                     return
 
-            stream_id = self._alloc_id()
-            state = StreamState()
-            self._streams[stream_id] = state
-            await self.send(stream_id, OPEN)
-            opened = True
-
-            trailing = await self._complete_guest_noauth(stream_id, state)
-            if trailing is None:
-                if self.auth is not None:
-                    writer.write(b'\x01\x01')
-                    await writer.drain()
-                return
+            # Ensure live GuestMux before completing greeting so `socks_ready()` checks guest liveness.
+            bound_proc = await self.ensure_connected()
             writer.write(b'\x01\x00' if self.auth is not None else b'\x05\x00')
-            if trailing:
-                writer.write(trailing)
             await writer.drain()
 
-            first_chunk = await reader.read(65536)
-            if not first_chunk:
-                await self.send_if_open(stream_id, EOF)
+            # Read RFC 1928 request header (VER, CMD, RSV) with bounded handshake timeout.
+            try:
+                req_hdr = await asyncio.wait_for(reader.readexactly(3), timeout=SOCKS_HANDSHAKE_TIMEOUT)
+            except asyncio.IncompleteReadError as exc:
+                if not exc.partial:
+                    return  # Clean probe EOF (e.g. `socks_ready`)
                 return
-            if first_chunk[0] == 0x05 and len(first_chunk) < 3:
-                try:
-                    first_chunk += await asyncio.wait_for(
-                        reader.readexactly(3 - len(first_chunk)), timeout=10.0,
-                    )
-                except asyncio.IncompleteReadError as exc:
-                    first_chunk += exc.partial
-                    await send_stream_data(self.send, stream_id, state, first_chunk)
-                    await self.send_if_open(stream_id, EOF)
-                    return
+            ver, cmd, rsv = req_hdr[0], req_hdr[1], req_hdr[2]
+            if ver != 0x05 or rsv != 0x00:
+                return
 
-            if len(first_chunk) >= 3 and first_chunk[:3] == b'\x05\x03\x00':
-                # Switch to SOCKS5 UDP ASSOCIATE without touching microsocks.
-                with contextlib.suppress(ConnectionError, OSError):
-                    await self.send_if_open(stream_id, RST)
-                state.close_rst()
-                self._streams.pop(stream_id, None)
+            parsed = await _read_socks5_addr_port_raw(reader, timeout=SOCKS_HANDSHAKE_TIMEOUT)
+            if parsed is None:
+                return
+            atyp, req_host, req_port, raw_addr = parsed
+
+            if cmd == 0x03:
+                await self._handle_udp_associate(bound_proc, reader, writer, atyp, req_host, req_port)
+                return
+
+            if cmd != 0x01:
+                writer.write(_socks5_reply(REP_CMD_NOT_SUPPORTED))
+                await writer.drain()
+                return
+
+            if atyp == 'unsupported':
+                writer.write(_socks5_reply(REP_ATYP_NOT_SUPPORTED))
+                await writer.drain()
+                return
+
+            if req_port == 0 or len(self._streams) >= self._max_tcp_streams:
+                writer.write(_socks5_reply(REP_GENERAL_FAILURE))
+                await writer.drain()
+                return
+
+            stream_id = self._alloc_id()
+            state = StreamState()
+            open_fut = asyncio.get_running_loop().create_future()
+            self._streams[stream_id] = state
+            self._pending_opens[stream_id] = open_fut
+            await self.send_on(bound_proc, stream_id, TCP_OPEN, raw_addr)
+            opened = True
+
+            kind, payload = await asyncio.wait_for(open_fut, timeout=TCP_OPEN_TIMEOUT)
+            if kind == OPEN_ERR:
                 opened = False
-                stream_id = None
-                await self._handle_udp_associate(reader, writer, initial=first_chunk[3:])
+                rep = payload[0] if payload else REP_GENERAL_FAILURE
+                writer.write(_socks5_reply(rep))
+                await writer.drain()
+                return
+            if kind != OPEN_OK:
+                opened = False
+                writer.write(_socks5_reply(REP_GENERAL_FAILURE))
+                await writer.drain()
                 return
 
-            if not await send_stream_data(self.send, stream_id, state, first_chunk):
-                return
-
-            async def host_to_guest():
-                while True:
-                    data = await reader.read(65536)
-                    if not data:
-                        await self.send(stream_id, EOF)
-                        return
-                    if not await send_stream_data(self.send, stream_id, state, data):
-                        return
-
-            async def guest_to_host():
-                pending_win = 0
-                while True:
-                    kind, payload = await state.recv()
-                    if kind == DATA:
-                        writer.write(payload)
-                        await writer.drain()
-                        pending_win += len(payload)
-                        if pending_win >= WINDOW_REPLENISH:
-                            inc = pending_win
-                            pending_win = 0
-                            await self.send(stream_id, WINDOW_UPDATE, WIN_STRUCT.pack(inc))
-                    elif kind == EOF:
-                        if writer.can_write_eof():
-                            with contextlib.suppress(ConnectionError, OSError):
-                                writer.write_eof()
-                        return
-                    elif kind == RST:
-                        return
-
-            await splice_tasks(host_to_guest(), guest_to_host(), drain_timeout=300)
+            writer.write(b'\x05\x00\x00' + payload)
+            await writer.drain()
+            await self._splice_host_stream(bound_proc, stream_id, state, reader, writer)
         except (ConnectionError, OSError, asyncio.TimeoutError, asyncio.CancelledError):
             if opened and stream_id is not None:
                 with contextlib.suppress(ConnectionError, OSError):
-                    await self.send_if_open(stream_id, RST)
+                    await self.send_if_open(stream_id, RST, proc=bound_proc)
         finally:
             if stream_id is not None:
+                self._pending_opens.pop(stream_id, None)
                 self._streams.pop(stream_id, None)
             writer.close()
             with contextlib.suppress(ConnectionError, OSError):
@@ -914,37 +1637,52 @@ class HostMuxTunnel:
 
     async def close(self):
         self._closing = True
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+        if self._callback_timer is not None and not self._callback_timer.done():
+            self._callback_timer.cancel()
+        for task in list(self._callback_conns):
+            if not task.done():
+                task.cancel()
+        if self._callback_conns:
+            await asyncio.gather(*list(self._callback_conns), return_exceptions=True)
+        await self._close_callback_servers()
+        self._fail_waiters('bridge is shutting down')
+
         proc = self._process
         self._process = None
-        if proc is not None and proc.returncode is None:
-            with contextlib.suppress(OSError):
-                proc.stdin.close()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.terminate()
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    with contextlib.suppress(ProcessLookupError):
-                        proc.kill()
-                    await proc.wait()
-        for task in (self._reader_task, self._stderr_task):
-            if task and not task.done():
+        procs = list(self._active_procs)
+        if proc is not None and proc not in procs:
+            procs.append(proc)
+        for p in procs:
+            await self._reap_process(p)
+
+        tasks = [
+            t for t in (
+                self._heartbeat_task,
+                self._reader_task,
+                self._stderr_task,
+                *list(self._bg_tasks),
+            )
+            if t is not None
+        ]
+        for task in tasks:
+            if not task.done():
                 task.cancel()
-        tasks = [t for t in (self._reader_task, self._stderr_task) if t]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._bg_tasks.clear()
 
 
 async def _splice_tcp(reader, writer, target_host, target_port):
-    """Raw bidirectional TCP forwarder (used for the `accept lan` VNC guard)."""
+    """Raw bidirectional TCP forwarder (used for `accept lan` and `accept all` VNC front proxy)."""
     backend_writer = None
+    _enable_tcp_keepalive(writer.get_extra_info('socket'))
     try:
         backend_reader, backend_writer = await asyncio.wait_for(
             asyncio.open_connection(target_host, target_port), timeout=5.0,
         )
+        _enable_tcp_keepalive(backend_writer.get_extra_info('socket'))
 
         async def pump(src, dst):
             while data := await src.read(65536):
@@ -989,8 +1727,10 @@ def _install_stop_handlers(loop, stopped):
 
 
 async def serve(engine, name, port, bind_host='127.0.0.1', auth=None,
-                lan_only=False, vnc_front_port=None, vnc_back_port=None):
-    tunnel = HostMuxTunnel(engine, name, auth=auth)
+                lan_only=False, vnc_front_port=None, vnc_back_port=None,
+                profile=None, vnc_rate_limit=False):
+    tunnel = HostMuxTunnel(engine, name, auth=auth, profile=profile)
+    vnc_limiter = _ConnRateLimiter() if vnc_rate_limit else None
     connections = set()
     loop = asyncio.get_running_loop()
     stopped = asyncio.Event()
@@ -1015,6 +1755,13 @@ async def serve(engine, name, port, bind_host='127.0.0.1', auth=None,
             with contextlib.suppress(ConnectionError, OSError):
                 await writer.wait_closed()
             return
+        if vnc_limiter is not None:
+            peer = writer.get_extra_info('peername')
+            if peer and not vnc_limiter.allow(peer[0]):
+                writer.close()
+                with contextlib.suppress(ConnectionError, OSError):
+                    await writer.wait_closed()
+                return
         task = asyncio.current_task()
         connections.add(task)
         try:
@@ -1022,24 +1769,27 @@ async def serve(engine, name, port, bind_host='127.0.0.1', auth=None,
         finally:
             connections.discard(task)
 
-    servers = [await asyncio.start_server(accept_socks, bind_host, port)]
+    servers = await _start_dual_stack_servers(accept_socks, bind_host, port)
     if vnc_front_port and vnc_back_port:
         try:
-            servers.append(await asyncio.start_server(accept_vnc, bind_host, vnc_front_port))
+            servers.extend(await _start_dual_stack_servers(accept_vnc, bind_host, vnc_front_port))
         except OSError:
             for srv in servers:
                 srv.close()
+            for srv in servers:
                 await srv.wait_closed()
             raise
 
     scope_label = 'LAN only' if lan_only else ('local' if bind_host == '127.0.0.1' else 'all')
     auth_label = 'password required' if auth else 'no password'
     mode_label = f'{scope_label}, {auth_label}'
-    say(f'SOCKS5 {bind_host}:{port} into {name} ({engine.cli}, multiplexed, {mode_label})')
+    say(f'SOCKS5 {bind_host}:{port} into {name} ({engine.cli}, mux v{BRIDGE_PROTO}, {mode_label})')
     if vnc_front_port and vnc_back_port:
-        say(f'VNC guard {bind_host}:{vnc_front_port} -> 127.0.0.1:{vnc_back_port} (LAN only)')
+        guard_label = 'LAN only' if lan_only else 'rate-limited'
+        say(f'VNC proxy {bind_host}:{vnc_front_port} -> 127.0.0.1:{vnc_back_port} ({guard_label})')
     with contextlib.suppress(OSError, ConnectionError):
         await tunnel.ensure_connected()
+    tunnel.start_heartbeat()
     try:
         await stopped.wait()
     finally:
@@ -1055,7 +1805,7 @@ async def serve(engine, name, port, bind_host='127.0.0.1', auth=None,
 
 
 def run_bridge(engine, profile):
-    """Run the multiplexed SOCKS5 bridge (and LAN VNC guard in `accept lan` mode)."""
+    """Run the multiplexed SOCKS5 bridge (and VNC front proxy in `accept lan`/`all` modes)."""
     if engine.container_state(profile) != 'running':
         die(f'{profile} is not running')
     mode = accept_mode()
@@ -1064,8 +1814,9 @@ def run_bridge(engine, profile):
     bind_host = bind_address(mode)
     auth = (AUTH_USER, password) if password else None
     lan_only = mode == 'lan'
-    vnc_front = desktop_port(profile) if lan_only else None
-    vnc_back = desktop_backend_port(profile) if lan_only else None
+    vnc_fronted = _needs_vnc_front_proxy(mode)
+    vnc_front = desktop_port(profile) if vnc_fronted else None
+    vnc_back = desktop_backend_port(profile) if vnc_fronted else None
 
     live_pid, live_engine, _, _, _ = bridge_record(profile)
     if live_pid and live_pid != os.getpid():
@@ -1083,6 +1834,8 @@ def run_bridge(engine, profile):
             lan_only=lan_only,
             vnc_front_port=vnc_front,
             vnc_back_port=vnc_back,
+            profile=profile,
+            vnc_rate_limit=(mode == 'all'),
         ))
     except OSError as error:
         ports = f'{socks_port(profile)}/{vnc_front}' if vnc_front else str(socks_port(profile))
@@ -1095,3 +1848,4 @@ def run_bridge(engine, profile):
             recorded_pid, _, _, _, _ = _parse_pidfile(bridge_pidfile(profile))
             if recorded_pid == os.getpid():
                 bridge_pidfile(profile).unlink(missing_ok=True)
+                health_file(profile).unlink(missing_ok=True)

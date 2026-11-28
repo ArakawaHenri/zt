@@ -6,6 +6,7 @@ import io
 import itertools
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -13,6 +14,11 @@ import sys
 import threading
 import time
 from typing import NamedTuple
+
+try:
+    import resource
+except ImportError:  # Windows
+    resource = None
 
 from zt.config import configured_engine, die, setting, target_arch, warn
 from zt.spec import (
@@ -24,6 +30,7 @@ from zt.spec import (
     STATE_MOUNT,
     container_name,
     host_arch,
+    normalize_arch,
     platform_for,
 )
 
@@ -34,6 +41,39 @@ ENGINE_REFUSED = 'Connection refused'
 _MANAGED_TAG_RE = re.compile(
     r'^localhost/zt-(base|' + '|'.join(CLIENTS) + r'):.+-[0-9a-f]{12}(-unverified)?$'
 )
+_BUILDX_VER_RE = re.compile(r'\bv?(\d+)\.(\d+)(?:\.(\d+))?\b')
+
+_NOFILE_SOFT = 1024
+_NOFILE_HARD = 65536
+_DOCKER_STATIC_SYSCTLS = (
+    'net.ipv4.tcp_mtu_probing=1',
+    'net.ipv4.tcp_keepalive_time=60',
+    'net.ipv4.tcp_keepalive_intvl=15',
+    'net.ipv4.tcp_keepalive_probes=4',
+    'net.ipv4.tcp_retries2=8',
+)
+
+
+def _nofile_ulimit(is_rootless=False):
+    """Return `nofile=<soft>:<hard>` clamped to the host hard limit on rootless Linux."""
+    soft, hard = _NOFILE_SOFT, _NOFILE_HARD
+    if is_rootless and sys.platform.startswith('linux') and resource is not None:
+        try:
+            _, host_hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if 0 < host_hard < hard:
+                hard = host_hard
+                soft = min(soft, hard)
+        except (OSError, ValueError):
+            pass
+    return f'nofile={soft}:{hard}'
+
+
+def _is_cross_arch(arch):
+    """True when target container `arch` differs from the physical host CPU arch."""
+    if not arch:
+        return False
+    native = normalize_arch(platform.machine())
+    return bool(native and arch != native)
 
 
 def refused(proc):
@@ -334,14 +374,26 @@ class Engine:
         caps = self.resolved_caps(caps_override)
         return [arg for cap in CAPABILITIES[caps] for arg in ('--cap-add', cap)]
 
-    def container_flags(self, caps_override=None):
+    def container_flags(self, caps_override=None, profile=None, arch=None, mac_address=None):
         raise NotImplementedError
 
-    def fingerprint(self, ref, env, port, bind_host='127.0.0.1', volume=None):
+    def fingerprint(self, ref, env, port, bind_host='127.0.0.1', volume=None,
+                    profile=None, mac_address=None, arch=None):
         """Digest of everything a container was created from."""
+        if profile is None and isinstance(volume, str) and volume.startswith('zt-state-'):
+            profile = volume[len('zt-state-'):]
+        effective_arch = arch
+        if effective_arch is None:
+            try:
+                effective_arch = host_arch()
+            except ValueError:
+                effective_arch = None
+        flags = self.container_flags(
+            profile=profile, arch=effective_arch, mac_address=mac_address,
+        )
         return hashlib.sha256(
             json.dumps(
-                [ref, env, port, bind_host, volume or '', self.container_flags()],
+                [ref, env, port, bind_host, volume or '', flags],
                 sort_keys=True,
             ).encode()
         ).hexdigest()[:12]
@@ -356,13 +408,14 @@ class Engine:
         raise NotImplementedError
 
     def run_container(self, name, ref, env, port, labels, bind_host='127.0.0.1',
-                      arch=None, volume=None, quiet=False):
+                      arch=None, volume=None, quiet=False, mac_address=None):
         """Create and start a container; VNC_PW is passed via child env, never argv."""
         arch = arch or target_arch()
+        profile = (labels or {}).get('zt.profile') or (labels or {}).get('zt.verify')
         args = ['run', '-d', '--name', name, '--platform', platform_for(arch)]
         if self.pass_hostname:
             args += ['--hostname', name]
-        args += [*self.container_flags()]
+        args += [*self.container_flags(profile=profile, arch=arch, mac_address=mac_address)]
         child_env = dict(os.environ)
         for key, value in env.items():
             if key == 'VNC_PW':
@@ -425,11 +478,56 @@ class AppleContainerEngine(Engine):
             return False
         return isinstance(status, dict) and status.get('status') == 'running'
 
-    def container_flags(self, caps_override=None):
+    @functools.cached_property
+    def _run_help_text(self):
+        cli_bin = shutil.which(self.cli)
+        if not cli_bin:
+            return ''
+        try:
+            proc = subprocess.run(
+                [cli_bin, 'run', '--help'],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                errors='replace', check=False, timeout=5,
+            )
+            return (proc.stdout + proc.stderr) if proc.returncode == 0 else ''
+        except (OSError, subprocess.TimeoutExpired):
+            return ''
+
+    @property
+    def _supports_ulimit(self):
+        return '--ulimit' in self._run_help_text
+
+    @property
+    def _supports_network_mac(self):
+        return ',mac=' in self._run_help_text
+
+    @property
+    def _supports_read_only_path(self):
+        # Apple Container isolates each container in its own Virtualization.framework
+        # microVM and has no `--sysctl` flag, so `--read-only-path NONE` lets
+        # zt-net-setup.sh write netns sysctls (tcp_mtu_probing, keepalive, rp_filter,
+        # utun*.route_localnet) inside the microVM. Degrade cleanly if a future CLI
+        # removes this experimental flag.
+        return (not self._run_help_text) or ('--read-only-path' in self._run_help_text)
+
+    def container_flags(self, caps_override=None, profile=None, arch=None, mac_address=None):
         adds = self._cap_flags(caps_override)
+        memory = '3G' if _is_cross_arch(arch) else '2G'
+        ro_path = ('--read-only-path', 'NONE') if self._supports_read_only_path else ()
+        ulimits = (
+            ('--ulimit', _nofile_ulimit(False), '--ulimit', 'core=0:0')
+            if self._supports_ulimit
+            else ()
+        )
+        network = (
+            ('--network', f'default,mac={mac_address}')
+            if (mac_address and self._supports_network_mac)
+            else ()
+        )
         return (
-            '--cpus', '2', '--memory', '2G', *adds,
-            '--read-only-path', 'NONE', '--shm-size', '512m', '--user', 'root',
+            '--cpus', '2', '--memory', memory, *adds,
+            *ro_path, '--shm-size', '256m',
+            *ulimits, *network, '--user', 'root',
         )
 
     def ensure_volume(self, name, profile):
@@ -446,7 +544,16 @@ class AppleContainerEngine(Engine):
         return True
 
     def remove_volume(self, name):
-        return self.run_cli('volume', 'rm', name, quiet=True, check=False).returncode == 0
+        # Apple Container microVM teardown can briefly hold the ext4 volume lock
+        # right after `container rm -f`; retry once after a short pause if still present.
+        for attempt in range(2):
+            if self.run_cli('volume', 'rm', name, quiet=True, check=False).returncode == 0:
+                return True
+            if attempt == 0 and self.volume_exists(name):
+                time.sleep(0.5)
+                continue
+            return False
+        return False
 
     def inspect(self, name):
         proc = self.run_cli('inspect', name, quiet=True, check=False)
@@ -543,7 +650,15 @@ class DockerEngine(Engine):
                 has_selinux = True
             if host_sec.get('AppArmorEnabled'):
                 has_apparmor = True
-            if 'docker desktop' in str(info.get('OperatingSystem', '')).lower():
+            os_name = str(info.get('OperatingSystem', '')).lower()
+            node_name = str(info.get('Name', '')).lower()
+            kernel_ver = str(info.get('KernelVersion', '')).lower()
+            if (
+                any(tok in os_name for tok in ('docker desktop', 'orbstack', 'rancher desktop'))
+                or node_name == 'orbstack'
+                or node_name.startswith(('colima', 'lima-'))
+                or 'orbstack' in kernel_ver
+            ):
                 is_desktop_vm = True
             if (
                 any(k in host_info for k in ('BuildahVersion', 'Conmon', 'Slirp4netns'))
@@ -588,6 +703,27 @@ class DockerEngine(Engine):
                 return line.split(':', 1)[1].strip()
         return ''
 
+    @functools.cached_property
+    def _buildx_version(self):
+        """Return `(major, minor)` parsed from `docker buildx version`, or None."""
+        try:
+            proc = self.run_cli('buildx', 'version', quiet=True, check=False, timeout=10, retry=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0:
+            return None
+        match = _BUILDX_VER_RE.search(proc.stdout or '')
+        if not match:
+            return None
+        major, minor = int(match.group(1)), int(match.group(2))
+        return (major, minor) if (major or minor) else None
+
+    @property
+    def supports_multi_output_build(self):
+        # Multiple --output flags (e.g. --load + --output type=oci) require Buildx >= 0.13.
+        ver = self._buildx_version
+        return True if ver is None else ver >= (0, 13)
+
     @property
     def needs_external_build_load(self):
         # Non-'docker' buildx drivers (e.g. 'docker-container', 'remote') build in an
@@ -624,10 +760,12 @@ class DockerEngine(Engine):
         return sys.platform.startswith('linux') and not self.is_rootless and not self.is_desktop_vm
 
     def net_mode_for(self, accept='local'):
-        # Podman (rootless & rootful machine/gvproxy) uses routed forwarding, and
-        # Docker in `accept all` forwards external LAN source IPs via DNAT, so both
-        # use subnet mode (still dropping all peer containers & VPN tunnels).
-        return 'subnet' if (self.is_podman or accept == 'all') else 'gateway'
+        # Containers publish :6901 strictly on loopback in all accept modes (the
+        # host bridge fronts both lan and all), so Docker stays in strictest gateway
+        # mode even for accept all. Podman (rootless & rootful machine/gvproxy)
+        # uses routed forwarding and keeps subnet mode (dropping peer containers &
+        # VPN tunnels).
+        return 'subnet' if self.is_podman else 'gateway'
 
     def is_running(self):
         try:
@@ -650,16 +788,33 @@ class DockerEngine(Engine):
             ]
         return [arg for cap in CAPABILITIES[caps] for arg in ('--cap-add', cap)]
 
-    def container_flags(self, caps_override=None):
+    def container_flags(self, caps_override=None, profile=None, arch=None, mac_address=None):
         adds = self._cap_flags(caps_override)
+        memory = '3g' if _is_cross_arch(arch) else '2g'
+        sysctls = list(_DOCKER_STATIC_SYSCTLS)
+        if self.is_rootless and not self.is_podman:
+            # Rootless Docker may inherit MNT_LOCK_READONLY on /proc/sys, so pass
+            # per-netns conf fallbacks via --sysctl (eth0 already exists, so default.*
+            # only applies to subsequently created VPN interfaces like utun7).
+            sysctls.append('net.ipv4.conf.all.rp_filter=2')
+            if profile == 'atrust':
+                sysctls.append('net.ipv4.conf.default.route_localnet=1')
         base = [
-            '--cpus', '2', '--memory', '2g',
+            '--cpus', '2', '--memory', memory,
             '--pids-limit', '1024',
-            '--shm-size', '512m', '--user', 'root',
+            '--shm-size', '256m',
+            '--ulimit', _nofile_ulimit(self.is_rootless),
+            '--ulimit', 'core=0:0',
+            '--user', 'root',
             '--tmpfs', '/run:rw,nosuid,nodev,size=64m',
             '--tmpfs', '/run/lock:rw,noexec,nosuid,nodev,size=16m',
             '--cgroupns=private',
+            *(arg for kv in sysctls for arg in ('--sysctl', kv)),
         ]
+        if mac_address and not self.is_rootless_podman:
+            # Pin deterministic MAC directly on default bridge (avoids creating a
+            # custom network & Docker 127.0.0.11 DNS); skip on rootless Podman pasta.
+            base += ['--mac-address', mac_address]
         if self.is_rootless_podman or self.has_selinux:
             # systemd requires label=disable when SELinux or rootless Podman confinement is active.
             base += ['--security-opt', 'label=disable']

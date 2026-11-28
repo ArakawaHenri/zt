@@ -1,1 +1,11 @@
-stalonetray -f 0 &
+if [ -r "$HOME/.Xresources" ] && command -v xrdb >/dev/null 2>&1; then
+    xrdb -merge "$HOME/.Xresources" >/dev/null 2>&1 || true
+fi
+if command -v autocutsel >/dev/null 2>&1; then
+    autocutsel -fork >/dev/null 2>&1 || true
+    autocutsel -selection PRIMARY -fork >/dev/null 2>&1 || true
+fi
+if command -v dunst >/dev/null 2>&1; then
+    dunst >/dev/null 2>&1 &
+fi
+stalonetray --geometry 4x1-0+0 --icon-size 24 --window-layer top --sticky --skip-taskbar --kludges force_icons_size -f 0 &

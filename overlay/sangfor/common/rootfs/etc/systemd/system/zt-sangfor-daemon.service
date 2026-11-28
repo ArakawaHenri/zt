@@ -1,0 +1,23 @@
+[Unit]
+Description=Sangfor VPN client background daemon
+Requires=zt-net.service
+After=zt-net.service network-online.target aTrustDaemon.service eaio_service.service EasyMonitor.service
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+User=root
+NoNewPrivileges=true
+CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_PTRACE
+Environment=HOME=/root
+Environment=LANG=en_US.UTF-8
+ExecStartPre=/usr/bin/setpriv --reuid kasm-user --regid kasm-user --init-groups --no-new-privs /usr/bin/env HOME=/home/kasm-user /bin/sh -c '[ ! -x /usr/local/bin/zt-conf.sh ] || /usr/local/bin/zt-conf.sh init'
+ExecStart=/usr/local/bin/zt-sangfor-daemon.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=6
+StandardOutput=append:/var/log/zt-sangfor.log
+StandardError=append:/var/log/zt-sangfor.log
+
+[Install]
+WantedBy=multi-user.target

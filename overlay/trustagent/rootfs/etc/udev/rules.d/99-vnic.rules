@@ -1,2 +1,0 @@
-SUBSYSTEM=="net", ACTION=="add", KERNEL=="vnic[0-9]*", RUN+="/usr/bin/systemctl --no-block start udev-vnic-add@%k.service"
-SUBSYSTEM=="net", ACTION=="remove", KERNEL=="vnic[0-9]*", RUN+="/usr/bin/systemctl --no-block start udev-vnic-remove@%k.service"

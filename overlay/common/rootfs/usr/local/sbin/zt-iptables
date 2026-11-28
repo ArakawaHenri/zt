@@ -1,0 +1,321 @@
+#!/bin/bash
+# Unified iptables/ip6tables backend dispatcher and policy invariant guard.
+#
+# 1. Auto-detects and locks a single working kernel backend (nft vs legacy,
+#    preferring nft unless nft is unavailable or legacy already holds engine
+#    DOCKER_OUTPUT rules) into /run/zt/iptables-backend via `--init`.
+# 2. Dispatches through private root-owned /usr/local/lib/zt-ipt/{nft,legacy}/
+#    symlinks so xtables-{nft,legacy}-multi always sees canonical basename(argv[0]).
+# 3. Passes ZT_IPT_INTERNAL=1 and read-only queries straight through with zero
+#    locking. Serializes external writes under /run/zt/iptables.lock, runs the
+#    vendor command verbatim, and self-heals displaced/flushed ZT-INPUT,
+#    ZT-OUTPUT, nat MASQUERADE, or mangle rules via zt-net-setup.sh --reapply.
+set -eu
+
+IPT_LIB=/usr/local/lib/zt-ipt
+STATE_DIR=/run/zt
+BACKEND_FILE="$STATE_DIR/iptables-backend"
+WAN_ENV="$STATE_DIR/wan.env"
+LOCK_FILE="$STATE_DIR/iptables.lock"
+NET_SETUP=/usr/local/bin/zt-net-setup.sh
+
+normalize_cmd() {
+    case "$1" in
+        iptables|iptables-nft|iptables-legacy) echo iptables ;;
+        iptables-save|iptables-nft-save|iptables-legacy-save) echo iptables-save ;;
+        iptables-restore|iptables-nft-restore|iptables-legacy-restore) echo iptables-restore ;;
+        ip6tables|ip6tables-nft|ip6tables-legacy) echo ip6tables ;;
+        ip6tables-save|ip6tables-nft-save|ip6tables-legacy-save) echo ip6tables-save ;;
+        ip6tables-restore|ip6tables-nft-restore|ip6tables-legacy-restore) echo ip6tables-restore ;;
+        *) echo '' ;;
+    esac
+}
+
+backend_works() {
+    local dir="$IPT_LIB/$1"
+    [ -x "$dir/iptables" ] || return 1
+    "$dir/iptables" -t filter -L -n >/dev/null 2>&1 || return 1
+    "$dir/iptables" -t nat -L -n >/dev/null 2>&1 || return 1
+    return 0
+}
+
+has_engine_nat() {
+    local dir="$IPT_LIB/$1"
+    [ -x "$dir/iptables-save" ] || return 1
+    "$dir/iptables-save" -t nat 2>/dev/null | grep -q 'DOCKER_OUTPUT'
+}
+
+detect_backend() {
+    local nft_ok=0 legacy_ok=0
+    backend_works nft && nft_ok=1
+    backend_works legacy && legacy_ok=1
+
+    if [ "$nft_ok" = 1 ] && [ "$legacy_ok" = 1 ]; then
+        if has_engine_nat legacy && ! has_engine_nat nft; then
+            echo legacy
+            return 0
+        fi
+        if "$IPT_LIB/nft/iptables" -t mangle -L -n >/dev/null 2>&1; then
+            echo nft
+            return 0
+        fi
+        if "$IPT_LIB/legacy/iptables" -t mangle -L -n >/dev/null 2>&1; then
+            echo legacy
+            return 0
+        fi
+        echo nft
+        return 0
+    fi
+    if [ "$nft_ok" = 1 ]; then
+        echo nft
+        return 0
+    fi
+    if [ "$legacy_ok" = 1 ]; then
+        echo legacy
+        return 0
+    fi
+    if [ -x "$IPT_LIB/nft/iptables" ]; then
+        echo nft
+    else
+        echo legacy
+    fi
+}
+
+persist_backend() {
+    local backend=$1 tmp
+    mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+    chmod 0755 "$STATE_DIR" 2>/dev/null || true
+    tmp=$(mktemp "$STATE_DIR/.iptables-backend.XXXXXX" 2>/dev/null) || return 0
+    printf '%s\n' "$backend" > "$tmp"
+    chmod 0644 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$BACKEND_FILE" 2>/dev/null || rm -f "$tmp"
+}
+
+read_backend() {
+    local b=''
+    if [ -r "$BACKEND_FILE" ]; then
+        IFS= read -r b < "$BACKEND_FILE" || true
+    fi
+    case "$b" in
+        nft|legacy)
+            echo "$b"
+            return 0
+            ;;
+    esac
+    b=$(detect_backend)
+    if [ "$(id -u)" -eq 0 ]; then
+        persist_backend "$b"
+    fi
+    echo "$b"
+}
+
+invoked=$(basename "$0")
+if [ "$invoked" = "zt-iptables" ] && [ "${1:-}" = "--init" ]; then
+    backend=$(detect_backend)
+    persist_backend "$backend"
+    exit 0
+fi
+
+cmd=$(normalize_cmd "$invoked")
+if [ -z "$cmd" ]; then
+    echo "zt-iptables: unsupported invocation '$invoked'" >&2
+    exit 2
+fi
+
+backend=$(read_backend)
+real_bin="$IPT_LIB/$backend/$cmd"
+if [ ! -x "$real_bin" ]; then
+    echo "zt-iptables: missing backend binary $real_bin" >&2
+    exit 127
+fi
+
+# Internal zt calls skip locking and post-hooks to prevent recursion/deadlock.
+if [ "${ZT_IPT_INTERNAL:-0}" = "1" ]; then
+    exec "$real_bin" "$@"
+fi
+
+is_write_op() {
+    local arg
+    case "$cmd" in
+        iptables-save|ip6tables-save)
+            return 1
+            ;;
+        iptables-restore|ip6tables-restore)
+            for arg in "$@"; do
+                case "$arg" in
+                    -h|--help|-V|--version|-t|--test) return 1 ;;
+                esac
+            done
+            return 0
+            ;;
+    esac
+    for arg in "$@"; do
+        case "$arg" in
+            -[AIDRFXNPE]|-[AIDRFXNPE]*|-[nvx46]*[AIDRFXNPE]*)
+                return 0
+                ;;
+            --append|--append=*|--insert|--insert=*|--delete|--delete=*|--replace|--replace=*|--flush|--flush=*|--delete-chain|--delete-chain=*|--new-chain|--new-chain=*|--policy|--policy=*|--rename-chain|--rename-chain=*)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+if [ "$(id -u)" -ne 0 ] || [ ! -r "$WAN_ENV" ] || ! is_write_op "$@"; then
+    exec "$real_bin" "$@"
+fi
+
+read_mangle_expect() {
+    local f=$1 val=''
+    [ -f "$f" ] || { echo 0; return 0; }
+    IFS= read -r val < "$f" 2>/dev/null || true
+    case "$val" in
+        ''|*[!0-9]*) echo 1 ;;
+        *)
+            if [ "$val" -gt 0 ]; then
+                echo "$val"
+            else
+                echo 1
+            fi
+            ;;
+    esac
+}
+
+invariants_intact() {
+    local save_bin dump need_mangle=0 need_connmark=0 need_routed=0
+    case "$cmd" in
+        ip6tables*)
+            [ -d /proc/sys/net/ipv6 ] || return 0
+            save_bin="$IPT_LIB/$backend/ip6tables-save"
+            need_mangle=$(read_mangle_expect "$STATE_DIR/mangle6.ok")
+            dump=$("$save_bin" 2>/dev/null) || return 1
+            printf '%s\n' "$dump" | awk -v need_mangle="$need_mangle" '
+                /^\*/ { tbl = substr($0, 2); next }
+                tbl == "filter" && /^-A INPUT / && !seen_in {
+                    seen_in = 1
+                    in_ok = ($0 == "-A INPUT -j ZT-INPUT")
+                }
+                tbl == "filter" && /^-A ZT-INPUT / {
+                    if (index($0, "\"zt: loopback\"") && index($0, " -j ACCEPT")) f_loop = 1
+                    else if (index($0, "\"zt: loopback guard\"") && index($0, " -j DROP")) f_lo = 1
+                    else if (index($0, "\"zt: replies\"") && index($0, " -j ACCEPT")) f_rep = 1
+                    else if (index($0, "\"zt: dhcpv6\"") && index($0, " -j ACCEPT")) f_dhcp = 1
+                    else if (index($0, "\"zt: host only\"") && index($0, " -j DROP")) f_ho = 1
+                    else if (index($0, "\"zt: host only udp\"") && index($0, " -j DROP")) f_hou = 1
+                    else if (index($0, "\"zt: tunnel\"") && index($0, " -j DROP")) f_tu = 1
+                    else if (index($0, "\"zt: tunnel udp\"") && index($0, " -j DROP")) f_tuu = 1
+                    else f_in_other = 1
+                }
+                tbl == "mangle" && /^-A POSTROUTING / && !seen_mp {
+                    seen_mp = 1
+                    mp_ok = ($0 == "-A POSTROUTING -j ZT-POSTROUTING")
+                }
+                tbl == "mangle" && /^-A ZT-POSTROUTING / {
+                    if (index($0, "\"zt: mss\"") && index($0, " -j TCPMSS")) m_mss++
+                    else m_post_other = 1
+                }
+                END {
+                    ok = (in_ok && f_loop && f_lo && f_rep && f_dhcp \
+                        && f_ho && f_hou && f_tu && f_tuu && !f_in_other)
+                    if (need_mangle > 0 && !(mp_ok && m_mss >= need_mangle && !m_post_other)) ok = 0
+                    exit (ok ? 0 : 1)
+                }
+            '
+            ;;
+        *)
+            save_bin="$IPT_LIB/$backend/iptables-save"
+            need_mangle=$(read_mangle_expect "$STATE_DIR/mangle.ok")
+            [ -f "$STATE_DIR/connmark.ok" ] && need_connmark=1
+            grep -qx 'MODE=subnet' "$WAN_ENV" 2>/dev/null && need_routed=1
+            dump=$("$save_bin" 2>/dev/null) || return 1
+            printf '%s\n' "$dump" | awk \
+                -v need_mangle="$need_mangle" \
+                -v need_connmark="$need_connmark" \
+                -v need_routed="$need_routed" '
+                /^\*/ { tbl = substr($0, 2); next }
+                tbl == "filter" && /^-A INPUT / && !seen_in {
+                    seen_in = 1
+                    in_ok = ($0 == "-A INPUT -j ZT-INPUT")
+                }
+                tbl == "filter" && /^-A OUTPUT / && !seen_out {
+                    seen_out = 1
+                    out_ok = ($0 == "-A OUTPUT -j ZT-OUTPUT")
+                }
+                tbl == "filter" && /^-A ZT-INPUT / {
+                    if (index($0, "\"zt: loopback\"") && index($0, " -j ACCEPT")) f_loop = 1
+                    else if (index($0, "\"zt: loopback guard\"") && index($0, " -j DROP")) f_lo = 1
+                    else if (index($0, "\"zt: replies\"") && index($0, " -j ACCEPT")) f_rep = 1
+                    else if (index($0, "\"zt: host\"") && index($0, " -j ACCEPT")) f_host = 1
+                    else if (index($0, "\"zt: host routed\"") && index($0, " -j ACCEPT")) f_routed = 1
+                    else if (index($0, "\"zt: dhcp\"") && index($0, " -j ACCEPT")) f_dhcp = 1
+                    else if (index($0, "\"zt: host only\"") && index($0, " -j DROP")) f_ho = 1
+                    else if (index($0, "\"zt: host only udp\"") && index($0, " -j DROP")) f_hou = 1
+                    else if (index($0, "\"zt: tunnel\"") && index($0, " -j DROP")) f_tu = 1
+                    else if (index($0, "\"zt: tunnel udp\"") && index($0, " -j DROP")) f_tuu = 1
+                    else f_in_other = 1
+                }
+                tbl == "filter" && /^-A ZT-OUTPUT / {
+                    if (index($0, "\"zt: loopback out\"") && index($0, " -j ACCEPT")) f_lo_out = 1
+                    else if (index($0, "\"zt: kasmvnc out\"") && index($0, " -j ACCEPT")) f_kv++
+                    else f_out_other = 1
+                }
+                tbl == "nat" && /^-A POSTROUTING / && index($0, "\"zt: tunnel nat\"") && index($0, " -j MASQUERADE") {
+                    if (index($0, " -o tun+ ")) n_tun = 1
+                    if (index($0, " -o utun+ ")) n_utun = 1
+                    if (index($0, " -o vnic+ ")) n_vnic = 1
+                }
+                tbl == "mangle" && /^-A PREROUTING / && !seen_mpre {
+                    seen_mpre = 1
+                    mpre_ok = ($0 == "-A PREROUTING -j ZT-PREROUTING")
+                }
+                tbl == "mangle" && /^-A OUTPUT / && !seen_mout {
+                    seen_mout = 1
+                    mout_ok = ($0 == "-A OUTPUT -j ZT-OUTPUT")
+                }
+                tbl == "mangle" && /^-A POSTROUTING / && !seen_mpost {
+                    seen_mpost = 1
+                    mpost_ok = ($0 == "-A POSTROUTING -j ZT-POSTROUTING")
+                }
+                tbl == "mangle" && /^-A ZT-PREROUTING / {
+                    if (index($0, "\"zt: kasmvnc mark\"") && index($0, " -j CONNMARK")) m_pre_cm = 1
+                    else if (index($0, "\"zt: kasmvnc rpf\"") && index($0, " -j MARK")) m_pre_rpf = 1
+                    else m_pre_other = 1
+                }
+                tbl == "mangle" && /^-A ZT-OUTPUT / {
+                    if (index($0, "\"zt: kasmvnc mark\"") && index($0, " -j CONNMARK")) m_out = 1
+                    else m_out_other = 1
+                }
+                tbl == "mangle" && /^-A ZT-POSTROUTING / {
+                    if (index($0, "\"zt: mss\"") && index($0, " -j TCPMSS")) m_mss++
+                    else m_post_other = 1
+                }
+                END {
+                    need_kv = (need_connmark ? 2 : 1)
+                    ok = (in_ok && out_ok && f_loop && f_lo && f_rep && f_host && f_dhcp \
+                        && f_ho && f_hou && f_tu && f_tuu && !f_in_other \
+                        && f_lo_out && f_kv >= need_kv && !f_out_other \
+                        && n_tun && n_utun && n_vnic)
+                    if (need_routed && !f_routed) ok = 0
+                    if (!need_routed && f_routed) ok = 0
+                    if (need_mangle > 0 && !(mpost_ok && m_mss >= need_mangle && !m_post_other)) ok = 0
+                    if (need_connmark && !(mpre_ok && mout_ok && m_pre_cm && m_pre_rpf && !m_pre_other && m_out && !m_out_other)) ok = 0
+                    exit (ok ? 0 : 1)
+                }
+            '
+            ;;
+    esac
+}
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+exec 9>>"$LOCK_FILE"
+flock -x 9
+
+rc=0
+"$real_bin" "$@" 9>&- || rc=$?
+
+if [ -x "$NET_SETUP" ] && ! invariants_intact; then
+    env -u ZT_NET_MODE ZT_IPT_INTERNAL=1 "$NET_SETUP" --reapply >/dev/null 2>&1 || true
+fi
+
+exit "$rc"

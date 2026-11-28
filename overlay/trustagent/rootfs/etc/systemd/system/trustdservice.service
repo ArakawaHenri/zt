@@ -1,11 +1,13 @@
 [Unit]
 Description=TrustAgent trustdservice daemon
+Requires=zt-net.service
 Wants=network.target
-After=network.target network-online.target
+After=zt-net.service network.target network-online.target
 
 [Service]
 Type=simple
 NoNewPrivileges=true
+CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_PTRACE
 WorkingDirectory=/opt/apps/com.qianxin.trustagent/files/bin/
 ExecStart=/opt/apps/com.qianxin.trustagent/files/bin/trustdservice
 Restart=always

@@ -3,20 +3,23 @@ OVERLAY := $(shell find overlay -type f)
 SHELL_SCRIPTS := \
 	install.sh \
 	overlay/base/rootfs/usr/local/bin/zt-kasmvnc.sh \
+	overlay/common/rootfs/usr/bin/xdg-open \
 	overlay/common/rootfs/usr/local/bin/zt-init \
 	overlay/common/rootfs/usr/local/bin/zt-net-setup.sh \
+	overlay/common/rootfs/usr/local/sbin/zt-iptables \
 	overlay/sangfor/common/install-deb.sh \
-	overlay/sangfor/common/rootfs/usr/bin/xdg-open \
 	overlay/sangfor/atrust/rootfs/usr/bin/loginctl \
 	overlay/sangfor/atrust/rootfs/usr/sbin/sysctl-hook \
-	overlay/sangfor/atrust/rootfs/usr/local/bin/zt-sangfor-session.sh \
+	overlay/sangfor/atrust/rootfs/usr/local/bin/zt-sangfor-daemon.sh \
+	overlay/sangfor/atrust/rootfs/usr/local/bin/zt-sangfor-ui.sh \
 	overlay/sangfor/easyconnect/rootfs/usr/local/bin/zt-conf.sh \
-	overlay/sangfor/easyconnect/rootfs/usr/local/bin/zt-sangfor-session.sh \
+	overlay/sangfor/easyconnect/rootfs/usr/local/bin/zt-sangfor-daemon.sh \
+	overlay/sangfor/easyconnect/rootfs/usr/local/bin/zt-sangfor-ui.sh \
 	overlay/sangfor/easyconnect/rootfs/usr/share/sangfor/EasyConnect/resources/shell/open_browser.sh \
 	overlay/trustagent/rootfs/usr/bin/nmcli \
-	overlay/trustagent/rootfs/usr/local/bin/zt-trustagent-routes.sh \
-	overlay/trustagent/rootfs/usr/local/bin/zt-vnic-add.sh \
-	overlay/trustagent/rootfs/usr/local/bin/zt-vnic-remove.sh
+	overlay/trustagent/rootfs/usr/local/bin/zt-trustagent-routes.sh
+PYTHON_SCRIPTS := \
+	overlay/common/rootfs/usr/local/bin/zt-identity
 
 .PHONY: all install test lint clean
 
@@ -36,6 +39,7 @@ install: zt
 	install -m 755 zt $(DESTDIR)$(PREFIX)/bin/zt
 
 lint:
+	python3 -c 'import ast, sys; [ast.parse(open(p, encoding="utf-8").read(), filename=p) for p in sys.argv[1:]]' $(PYTHON_SCRIPTS)
 	@if command -v shellcheck >/dev/null 2>&1; then \
 		shellcheck $(SHELL_SCRIPTS); \
 	else \

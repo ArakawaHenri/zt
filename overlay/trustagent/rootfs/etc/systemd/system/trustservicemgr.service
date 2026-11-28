@@ -1,11 +1,14 @@
 [Unit]
 Description=TrustAgent service manager
-After=network.target
+Requires=zt-net.service
+After=zt-net.service network.target
 
 [Service]
+Type=simple
 NoNewPrivileges=true
-PIDFile=/var/run/trustservicemgr.pid
-ExecStartPre=/bin/rm -f /var/run/trustservicemgr.pid
+CapabilityBoundingSet=~CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_SYS_MODULE CAP_SYS_RAWIO CAP_SYS_PTRACE
+WorkingDirectory=/opt/apps/com.qianxin.trustagent/files/bin/
+ExecStartPre=/bin/rm -f /run/trustservicemgr.pid
 ExecStart=/opt/apps/com.qianxin.trustagent/files/bin/trustservicemgr
 Restart=always
 RestartSec=3

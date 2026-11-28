@@ -14,6 +14,15 @@ import sys
 
 
 def default_wan():
+    try:
+        with open('/run/zt/wan.env', encoding='utf-8') as handle:
+            for line in handle:
+                if line.startswith('WAN='):
+                    val = line.split('=', 1)[1].strip()
+                    if val:
+                        return val
+    except OSError:
+        pass
     proc = subprocess.run(
         ['ip', '-4', 'route', 'show', 'default'],
         capture_output=True, text=True, check=False,
@@ -21,7 +30,8 @@ def default_wan():
     for line in proc.stdout.splitlines():
         parts = line.split()
         if len(parts) >= 5 and parts[1] == 'via':
-            return parts[4]
+            if not parts[4].startswith(('lo', 'tun', 'utun', 'vnic', 'tap', 'wg')):
+                return parts[4]
     return ''
 
 
@@ -88,25 +98,26 @@ def cmd_toggle(direction, net_mode):
         print('no default route', file=sys.stderr)
         sys.exit(1)
 
-    subnet = link_subnet(wan) if net_mode == 'subnet' else ''
-    if net_mode == 'subnet' and not subnet:
-        print(f'no link-scope subnet on {wan}', file=sys.stderr)
-        sys.exit(1)
-
+    # Set ZT_IPT_INTERNAL=1 so zt-iptables does not immediately self-heal our
+    # intentional negative-control deletion during peer reachability probing.
+    internal_env = dict(os.environ, ZT_IPT_INTERNAL='1')
+    has_v6 = os.path.isdir('/proc/sys/net/ipv6')
     cmds = []
     for proto, comment in (('tcp', 'zt: host only'), ('udp', 'zt: host only udp')):
-        v4_cmd = ['iptables', '-t', 'filter', '-D', 'ZT-INPUT', '-i', wan]
-        if net_mode == 'subnet':
-            v4_cmd += ['-s', subnet]
-        v4_cmd += ['-p', proto, '-m', 'comment', '--comment', comment, '-j', 'DROP']
-        v6_cmd = [
-            'ip6tables', '-t', 'filter', '-D', 'ZT-INPUT', '-i', wan,
+        v4_cmd = [
+            'iptables', '-t', 'filter', '-D', 'ZT-INPUT', '-i', wan,
             '-p', proto, '-m', 'comment', '--comment', comment, '-j', 'DROP',
         ]
-        cmds.extend((v4_cmd, v6_cmd))
+        cmds.append(v4_cmd)
+        if has_v6:
+            v6_cmd = [
+                'ip6tables', '-t', 'filter', '-D', 'ZT-INPUT', '-i', wan,
+                '-p', proto, '-m', 'comment', '--comment', comment, '-j', 'DROP',
+            ]
+            cmds.append(v6_cmd)
 
     for cmd in cmds:
-        proc = subprocess.run(cmd, check=False)
+        proc = subprocess.run(cmd, env=internal_env, check=False)
         if proc.returncode != 0:
             sys.exit(proc.returncode)
 

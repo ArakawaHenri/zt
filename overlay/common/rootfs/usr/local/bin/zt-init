@@ -19,10 +19,13 @@ STATE_ROOT=/var/lib/zt-state
 if [ -d "$STATE_ROOT" ] && mountpoint -q "$STATE_ROOT"; then
     # Keep a unique, stable /etc/machine-id per state volume across container
     # recreates so zero-trust device identity survives upgrades & accept changes.
-    if [ ! -s "$STATE_ROOT/machine-id" ]; then
-        printf '%s\n' "$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')" > "$STATE_ROOT/machine-id"
-        chmod 0444 "$STATE_ROOT/machine-id"
-    fi
+    saved_mid=$(tr -d ' \t\r\n' <"$STATE_ROOT/machine-id" 2>/dev/null || true)
+    case "$saved_mid" in
+        ''|uninitialized)
+            printf '%s\n' "$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')" > "$STATE_ROOT/machine-id"
+            chmod 0444 "$STATE_ROOT/machine-id"
+            ;;
+    esac
     cp "$STATE_ROOT/machine-id" /etc/machine-id
     chmod 0444 /etc/machine-id
 
@@ -64,19 +67,108 @@ if [ -d "$STATE_ROOT" ] && mountpoint -q "$STATE_ROOT"; then
         done < /etc/zt/state-paths.conf
     fi
 
-    # Always refresh image-managed Openbox config inside persisted ~/.config.
+    # Always refresh image-managed Openbox config inside persisted ~/.config
+    # strictly as kasm-user so symlinks inside user-owned dirs cannot cross root.
     if [ -d /etc/zt/openbox ] && [ -d /home/kasm-user/.config ]; then
-        install -d -o kasm-user -g kasm-user -m 0755 /home/kasm-user/.config/openbox
+        setpriv --reuid kasm-user --regid kasm-user --init-groups --no-new-privs \
+            mkdir -p /home/kasm-user/.config/openbox
+        setpriv --reuid kasm-user --regid kasm-user --init-groups --no-new-privs \
+            chmod 0755 /home/kasm-user/.config/openbox
         for cfg in autostart menu.xml; do
             if [ -f "/etc/zt/openbox/$cfg" ]; then
-                install -o kasm-user -g kasm-user -m 0644 "/etc/zt/openbox/$cfg" "/home/kasm-user/.config/openbox/$cfg"
+                setpriv --reuid kasm-user --regid kasm-user --init-groups --no-new-privs \
+                    rm -f "/home/kasm-user/.config/openbox/$cfg"
+                setpriv --reuid kasm-user --regid kasm-user --init-groups --no-new-privs \
+                    install -m 0644 "/etc/zt/openbox/$cfg" "/home/kasm-user/.config/openbox/$cfg"
             fi
         done
     fi
 
-    # Clean stale Unix domain sockets left behind by a previously killed aTrust container.
-    if [ -d /usr/share/sangfor/.aTrust/var/run ]; then
-        find /usr/share/sangfor/.aTrust/var/run -type s -delete 2>/dev/null || true
+    # Enforce sticky bit on aTrust shared state dir (for upgraded volumes) and
+    # clean stale Unix domain sockets without traversing symlinks.
+    if [ -d /usr/share/sangfor/.aTrust ] && [ ! -L /usr/share/sangfor/.aTrust ]; then
+        chmod 1777 /usr/share/sangfor/.aTrust 2>/dev/null || true
+    fi
+    if [ -d /usr/share/sangfor/.aTrust/var/run ] \
+        && [ ! -L /usr/share/sangfor/.aTrust/var ] \
+        && [ ! -L /usr/share/sangfor/.aTrust/var/run ]; then
+        find -P /usr/share/sangfor/.aTrust/var/run -maxdepth 2 -type s -delete 2>/dev/null || true
+    fi
+fi
+
+# Prune volatile Electron caches inside persisted ~/.config strictly as
+# kasm-user so symlinks inside user-owned dirs cannot cross root, keeping
+# fixed-size 2 GiB Apple Container state volumes from filling up.
+if [ -d /home/kasm-user/.config ]; then
+    setpriv --reuid kasm-user --regid kasm-user --init-groups --no-new-privs \
+        /bin/sh -eu -s <<'EOF' || true
+for appdir in /home/kasm-user/.config/*; do
+    [ -d "$appdir" ] && [ ! -L "$appdir" ] || continue
+    for cache in Cache GPUCache "Code Cache"; do
+        target="$appdir/$cache"
+        if [ -d "$target" ] && [ ! -L "$target" ]; then
+            rm -rf -- "$target"
+        fi
+    done
+done
+EOF
+fi
+
+# Cap runaway zt service logs (> 5 MiB) on boot to prevent unbounded disk growth.
+for zlog in /var/log/zt-*.log; do
+    [ -f "$zlog" ] && [ ! -L "$zlog" ] || continue
+    size=$(wc -c <"$zlog" 2>/dev/null || echo 0)
+    if [ "$size" -gt 5242880 ]; then
+        : > "$zlog" 2>/dev/null || true
+    fi
+done
+
+# Ensure ephemeral containers (e.g. zt verify without a state volume) also have
+# a valid machine-id and keep /var/lib/dbus/machine-id synced with /etc/machine-id.
+current_mid=$(tr -d ' \t\r\n' </etc/machine-id 2>/dev/null || true)
+case "$current_mid" in
+    ''|uninitialized)
+        printf '%s\n' "$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')" > /etc/machine-id
+        chmod 0444 /etc/machine-id
+        ;;
+esac
+if [ -d /var/lib/dbus ]; then
+    ln -snf /etc/machine-id /var/lib/dbus/machine-id
+fi
+
+# Under Apple Container (no --tmpfs /run), /run is still on the rootfs until
+# systemd mounts a fresh empty tmpfs over it, hiding anything created here.
+# Pre-mount a tmpfs on /run (matching Docker's --tmpfs /run) so systemd keeps
+# it intact along with /run/zt, /run/zt-events, and /run/zt/iptables-backend.
+if ! mountpoint -q /run; then
+    mkdir -p /run
+    mount -t tmpfs -o rw,nosuid,nodev,mode=0755,size=64m tmpfs /run 2>/dev/null || true
+fi
+
+# Back up the initial container /etc/resolv.conf before VPN clients touch it,
+# and heal a stale loopback-only resolv.conf left behind by an unclean stop.
+install -d -o root -g root -m 0755 /run/zt
+install -d -o kasm-user -g kasm-user -m 0755 /run/zt-events
+if [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+    has_real_ns=$(awk '
+        $1 == "nameserver" && $2 != "127.0.0.1" && $2 != "127.0.0.53" && $2 != "::1" {
+            found = 1
+            exit
+        }
+        END { print found + 0 }
+    ' /etc/resolv.conf 2>/dev/null || echo 0)
+    if [ "$has_real_ns" = 1 ]; then
+        install -o root -g root -m 0644 /etc/resolv.conf /run/zt/resolv.orig
+        if [ -d "$STATE_ROOT" ] && mountpoint -q "$STATE_ROOT" && [ ! -L "$STATE_ROOT/resolv.orig" ]; then
+            install -o root -g root -m 0644 /etc/resolv.conf "$STATE_ROOT/resolv.orig" 2>/dev/null || true
+        fi
+    elif [ -f /run/zt/resolv.orig ] && [ ! -L /run/zt/resolv.orig ] && [ -w /etc/resolv.conf ]; then
+        cat /run/zt/resolv.orig > /etc/resolv.conf 2>/dev/null || true
+    elif [ -d "$STATE_ROOT" ] && mountpoint -q "$STATE_ROOT" \
+        && [ -f "$STATE_ROOT/resolv.orig" ] && [ ! -L "$STATE_ROOT/resolv.orig" ] \
+        && [ -w /etc/resolv.conf ]; then
+        install -o root -g root -m 0644 "$STATE_ROOT/resolv.orig" /run/zt/resolv.orig
+        cat "$STATE_ROOT/resolv.orig" > /etc/resolv.conf 2>/dev/null || true
     fi
 fi
 
@@ -85,6 +177,26 @@ fi
 # container's private cgroup namespace so systemd can create its own slices.
 if [ -d /sys/fs/cgroup ] && mountpoint -q /sys/fs/cgroup; then
     mount -o remount,rw /sys/fs/cgroup 2>/dev/null || true
+fi
+
+# Under Docker/Podman non-privileged containers, /proc/sys is mounted read-only.
+# Remount strictly /proc/sys/net/ipv4/conf (100% netns-private ipv4_devconf, used
+# for $wan.rp_filter=2 and aTrust's utun*.route_localnet=1) while keeping
+# host-global /proc/sys/net/core and the rest of /proc/sys strictly read-only.
+if [ -d /proc/sys/net/ipv4/conf ] && [ ! -w /proc/sys/net/ipv4/conf/lo/route_localnet ]; then
+    mount --bind /proc/sys/net/ipv4/conf /proc/sys/net/ipv4/conf 2>/dev/null \
+        && mount -o remount,rw,nosuid,nodev,noexec /proc/sys/net/ipv4/conf 2>/dev/null || true
+fi
+
+# Pre-systemd hardware identity synthesis (deterministic SMBIOS 3.0 + sysfs DMI
+# derived from /etc/machine-id; blocks host DMI leakage on rootful Docker).
+if [ -x /usr/local/bin/zt-identity ]; then
+    /usr/local/bin/zt-identity || true
+fi
+
+# Detect and lock the single active iptables backend (nft vs legacy) before systemd.
+if [ -x /usr/local/sbin/zt-iptables ]; then
+    /usr/local/sbin/zt-iptables --init || true
 fi
 
 exec /lib/systemd/systemd "$@"

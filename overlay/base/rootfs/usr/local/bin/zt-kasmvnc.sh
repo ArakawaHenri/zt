@@ -65,12 +65,23 @@ else
     vncserver "${vnc_args[@]}"
 fi
 
-for _ in $(seq 30); do
-    xdpyinfo -display :1 >/dev/null 2>&1 && break
+ready=0
+for _ in $(seq 60); do
+    if xdpyinfo -display :1 >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
     sleep 0.5
 done
+if [ "$ready" -ne 1 ]; then
+    echo 'zt-kasmvnc: X server on :1 did not become ready in time' >&2
+    exit 1
+fi
 
 xset -dpms >/dev/null 2>&1 || true
 xset s off >/dev/null 2>&1 || true
+if [ -r "$HOME/.Xresources" ] && command -v xrdb >/dev/null 2>&1; then
+    xrdb -merge "$HOME/.Xresources" >/dev/null 2>&1 || true
+fi
 
 exec /usr/bin/openbox-session

@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Install deterministic container-local SMBIOS 3.0 and sysfs DMI identity tables.
+
+Docker/runc masks /sys/firmware as a read-only empty tmpfs and omits /dev/mem,
+while /sys/devices/virtual/dmi/id (/sys/class/dmi/id) is NOT in OCI MaskedPaths
+and leaks host hardware IDs on rootful Linux Docker (or is unreadable on
+rootless Podman). Qianxin TrustAgent's libCollectionEngine.so reads
+/sys/firmware/dmi/tables/* and trustdservice's HWFP_V2 fallback reads
+/sys/class/dmi/id/product_serial; aTrust also reads /sys/class/dmi/id/*.
+
+Mounting a fresh 64 KiB read-only tmpfs (never remounting an inherited mount,
+avoiding MNT_LOCK_READONLY EPERM in user namespaces) populated deterministically
+from /etc/machine-id satisfies SMBIOS/DMI consumers identically across Docker,
+Podman, and Apple Container without exposing host hardware IDs.
+"""
+import argparse
+import hashlib
+import os
+import struct
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+FIRMWARE_DIR = Path('/sys/firmware')
+DMI_REL = Path('dmi/tables')
+DMI_ID_DIR = Path('/sys/devices/virtual/dmi/id')
+
+_INVALID_SEEDS = frozenset(('', 'uninitialized'))
+
+
+def _valid_seed(text):
+    cleaned = (text or '').strip()
+    if not cleaned or cleaned.lower() in _INVALID_SEEDS:
+        return None
+    return cleaned
+
+
+def _read_seed(override=None, paths=('/etc/machine-id', '/proc/sys/kernel/random/boot_id')):
+    if override is not None:
+        cleaned = _valid_seed(override)
+        if cleaned is None:
+            raise ValueError(f'invalid identity seed: {override!r}')
+        return cleaned.encode('utf-8')
+    for path in paths:
+        try:
+            cleaned = _valid_seed(Path(path).read_text(encoding='utf-8'))
+            if cleaned is not None:
+                return cleaned.encode('utf-8')
+        except OSError:
+            pass
+    return os.urandom(16).hex().encode('ascii')
+
+
+def _smbios_struct(stype, handle, body, strings):
+    """Encode one SMBIOS structure: 4-byte header + fixed body + NUL-terminated string set."""
+    header = struct.pack('<BBH', stype, 4 + len(body), handle)
+    if strings:
+        tail = b'\x00'.join(s.encode('ascii') for s in strings) + b'\x00\x00'
+    else:
+        tail = b'\x00\x00'
+    return header + body + tail
+
+
+def build_identity(seed_bytes):
+    """Return (smbios_entry_point_bytes, dmi_table_bytes, dmi_id_files_dict)."""
+    digest = hashlib.sha256(b'zt-smbios-v1:' + seed_bytes).digest()
+    raw_uuid = bytearray(digest[:16])
+    raw_uuid[6] = (raw_uuid[6] & 0x0F) | 0x40  # RFC 4122 version 4
+    raw_uuid[8] = (raw_uuid[8] & 0x3F) | 0x80  # RFC 4122 variant 1
+    sys_uuid = uuid.UUID(bytes=bytes(raw_uuid))
+
+    serial_hex = digest[16:22].hex().upper()
+    cpu_id = struct.unpack_from('<Q', digest, 22)[0]
+    sys_serial = f'ZT-{serial_hex}'
+    board_serial = f'ZT-BD-{serial_hex}'
+    chassis_serial = f'ZT-CH-{serial_hex}'
+    cpu_serial = f'ZT-CPU-{serial_hex}'
+
+    # Type 0: BIOS Information (18-byte fixed header+body)
+    t0_body = struct.pack('<BBHBB Q', 1, 2, 0xE800, 3, 0, 0)
+    t0 = _smbios_struct(0, 0x0000, t0_body, ['Linux', '1.0', '01/01/2025'])
+
+    # Type 1: System Information (27-byte fixed header+body, SMBIOS 2.4+)
+    t1_body = struct.pack('<BBBB', 1, 2, 3, 4) + sys_uuid.bytes_le + struct.pack('<BBB', 0x06, 5, 6)
+    t1 = _smbios_struct(1, 0x0001, t1_body, ['Linux', 'Container', '1.0', sys_serial, 'ZT', 'Linux'])
+
+    # Type 2: Base Board Information (15-byte fixed header+body)
+    t2_body = struct.pack('<BBBBBBBHBB', 1, 2, 3, 4, 0, 0x09, 0, 0x0003, 0x0A, 0)
+    t2 = _smbios_struct(2, 0x0002, t2_body, ['Linux', 'Container', '1.0', board_serial])
+
+    # Type 3: System Enclosure (21-byte fixed header+body, Desktop = 0x03)
+    t3_body = struct.pack('<BBBBBBBBB Q', 1, 0x03, 2, 3, 4, 0x03, 0x03, 0x03, 0x03, 0)
+    t3 = _smbios_struct(3, 0x0003, t3_body, ['Linux', '1.0', chassis_serial, 'None'])
+
+    # Type 4: Processor Information (48-byte fixed header+body, SMBIOS 3.0)
+    t4_body = struct.pack(
+        '<BBBBQBBHHHBBHHHBBBBBBHHHHH',
+        1,        # Socket Designation -> 'CPU0'
+        0x03,     # Processor Type: Central Processor
+        0xFE,     # Processor Family: see Processor Family 2
+        2,        # Processor Manufacturer -> 'Linux'
+        cpu_id,   # Processor ID (8 bytes deterministic)
+        3,        # Processor Version -> 'Virtual CPU'
+        0x00,     # Voltage
+        0,        # External Clock
+        2400,     # Max Speed (MHz)
+        2400,     # Current Speed (MHz)
+        0x41,     # Status: Populated + Enabled
+        0x02,     # Processor Upgrade: Unknown
+        0xFFFF,   # L1 Cache Handle
+        0xFFFF,   # L2 Cache Handle
+        0xFFFF,   # L3 Cache Handle
+        4,        # Serial Number -> cpu_serial
+        5,        # Asset Tag -> 'None'
+        6,        # Part Number -> 'None'
+        2,        # Core Count
+        2,        # Core Enabled
+        2,        # Thread Count
+        0x0004,   # Processor Characteristics: 64-bit Capable
+        0x0002,   # Processor Family 2: Unknown (arch-neutral)
+        2,        # Core Count 2
+        2,        # Core Enabled 2
+        2,        # Thread Count 2
+    )
+    t4 = _smbios_struct(4, 0x0004, t4_body, ['CPU0', 'Linux', 'Virtual CPU', cpu_serial, 'None', 'None'])
+
+    # Type 127: End-of-Table
+    t127 = _smbios_struct(127, 0x007F, b'', [])
+
+    dmi = t0 + t1 + t2 + t3 + t4 + t127
+
+    # SMBIOS 3.0 64-bit Entry Point (24 bytes):
+    # _SM3_ (5), checksum (1), length=24 (1), major=3 (1), minor=0 (1), docrev=0 (1),
+    # ep_rev=1 (1), reserved=0 (1), max_size (4), table_addr=0 (8)
+    ep = bytearray(struct.pack('<5sBBBBBBBIQ', b'_SM3_', 0, 24, 3, 0, 0, 1, 0, len(dmi), 0))
+    ep[5] = (-sum(ep)) & 0xFF
+
+    modalias = (
+        'dmi:bvnLinux:bvr1.0:bd01/01/2025:'
+        'svnLinux:pnContainer:pvr1.0:'
+        'rvnLinux:rnContainer:rvr1.0:'
+        'cvnLinux:ct3:cvr1.0:skuZT:'
+    )
+    dmi_id_files = {
+        'bios_date': '01/01/2025\n',
+        'bios_vendor': 'Linux\n',
+        'bios_version': '1.0\n',
+        'board_name': 'Container\n',
+        'board_serial': f'{board_serial}\n',
+        'board_vendor': 'Linux\n',
+        'board_version': '1.0\n',
+        'chassis_asset_tag': 'None\n',
+        'chassis_serial': f'{chassis_serial}\n',
+        'chassis_type': '3\n',
+        'chassis_vendor': 'Linux\n',
+        'chassis_version': '1.0\n',
+        'modalias': f'{modalias}\n',
+        'product_family': 'Linux\n',
+        'product_name': 'Container\n',
+        'product_serial': f'{sys_serial}\n',
+        'product_sku': 'ZT\n',
+        'product_uuid': f'{str(sys_uuid).lower()}\n',
+        'product_version': '1.0\n',
+        'sys_vendor': 'Linux\n',
+        'uevent': f'MODALIAS={modalias}\n',
+    }
+    return bytes(ep), dmi, dmi_id_files
+
+
+def build_smbios_tables(seed_bytes):
+    """Return (smbios_entry_point_bytes, dmi_table_bytes) for SMBIOS 3.0 (64-bit)."""
+    ep, dmi, _ = build_identity(seed_bytes)
+    return ep, dmi
+
+
+def _write_tables(base_dir, ep, dmi):
+    tables = base_dir / DMI_REL
+    tables.mkdir(parents=True, exist_ok=True)
+    for d in (base_dir / 'dmi', tables):
+        os.chmod(d, 0o755)
+    for name, payload in (('smbios_entry_point', ep), ('DMI', dmi)):
+        dest = tables / name
+        dest.write_bytes(payload)
+        os.chmod(dest, 0o444)
+
+
+def _write_dmi_id(id_dir, fields):
+    id_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(id_dir, 0o755)
+    for name, text in sorted(fields.items()):
+        dest = id_dir / name
+        dest.write_text(text, encoding='ascii')
+        os.chmod(dest, 0o444)
+
+
+def _mount_fresh_ro_tmpfs(target_dir, populate_fn):
+    """Overlay `target_dir` with a fresh 64 KiB read-only tmpfs (userns-safe)."""
+    if not target_dir.is_dir():
+        return
+    proc = subprocess.run(
+        ['mount', '-t', 'tmpfs', '-o', 'rw,nosuid,nodev,noexec,size=64k', 'tmpfs', str(target_dir)],
+        capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(f'zt-identity: mount {target_dir} failed: {proc.stderr.strip()}\n')
+        return
+    try:
+        populate_fn(target_dir)
+    finally:
+        subprocess.run(
+            ['mount', '-o', 'remount,ro,nosuid,nodev,noexec', str(target_dir)],
+            capture_output=True, check=False,
+        )
+
+
+def install_identity(seed=None, dump_dir=None):
+    ep, dmi, dmi_id_files = build_identity(_read_seed(seed))
+    if dump_dir is not None:
+        base = Path(dump_dir)
+        _write_tables(base, ep, dmi)
+        _write_dmi_id(base / 'dmi/id', dmi_id_files)
+        return 0
+
+    _mount_fresh_ro_tmpfs(FIRMWARE_DIR, lambda d: _write_tables(d, ep, dmi))
+    _mount_fresh_ro_tmpfs(DMI_ID_DIR, lambda d: _write_dmi_id(d, dmi_id_files))
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Install synthetic SMBIOS 3.0 and sysfs DMI tables.')
+    parser.add_argument('--dump-dir', help='Write tables and sysfs DMI files under this directory')
+    parser.add_argument('--seed', help='Override seed string (for deterministic tests)')
+    args = parser.parse_args(argv)
+    try:
+        return install_identity(seed=args.seed, dump_dir=args.dump_dir)
+    except ValueError as err:
+        sys.stderr.write(f'zt-identity: {err}\n')
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

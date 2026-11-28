@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Sangfor EasyConnect client (UOS arm64) on zt-base (official ubuntu:24.04 + KasmVNC).
 #
 # Built directly from the SHA256-verified official Sangfor archive
@@ -28,11 +27,12 @@ RUN apt-get update \
     && apt-get update \
     && apt-get install -y --no-install-recommends --no-install-suggests \
         libx11-xcb1 libnss3 libasound2t64 libxtst6 \
-        psmisc busybox libxss1 fonts-wqy-microhei socat \
-        libgtk2.0-0 libdbus-glib-1-2 libgconf-2-4 microsocks \
+        psmisc busybox net-tools libxss1 fonts-wqy-microhei socat \
+        libgtk2.0-0 libdbus-glib-1-2 libgconf-2-4 \
     && rm -rf /var/lib/apt/lists/* \
         /etc/apt/sources.list.d/zt-bookworm.list /etc/apt/preferences.d/zt-bookworm
 
+COPY ./rootfs/usr/local/sbin/zt-iptables /usr/local/sbin/zt-iptables
 COPY ./install-deb.sh /tmp/install-deb.sh
 COPY ./blobs/easyconnect.pkg /tmp/easyconnect.pkg
 COPY ./blobs/electron.zip /tmp/electron.zip
@@ -40,7 +40,7 @@ COPY ./blobs/electron.zip /tmp/electron.zip
 # Unpack the official Sangfor EasyConnect package (.zip on arm64 or direct .deb
 # on amd64), run its maintainer scripts, replace its bundled Electron binary
 # with official Electron 1.8.8, and restore root ownership over system paths.
-RUN chmod 0755 /tmp/install-deb.sh \
+RUN chmod 0755 /usr/local/sbin/zt-iptables /tmp/install-deb.sh \
     && if [ -n "${VPN_DEB_PATH}" ]; then \
         busybox unzip -p /tmp/easyconnect.pkg "${VPN_DEB_PATH}" > /tmp/vpn.deb; \
         rm -f /tmp/easyconnect.pkg; \
@@ -49,6 +49,10 @@ RUN chmod 0755 /tmp/install-deb.sh \
     fi \
     && /tmp/install-deb.sh /tmp/vpn.deb \
     && rm -f /tmp/install-deb.sh \
+    && for cmd in iptables iptables-save iptables-restore \
+                  ip6tables ip6tables-save ip6tables-restore; do \
+           ln -snf /usr/local/sbin/zt-iptables "/usr/sbin/$cmd"; \
+       done \
     && ln -fs /bin/false /usr/sbin/dmidecode \
     && rm -f /usr/share/sangfor/EasyConnect/resources/conf/easy_connect.json \
     && mv /usr/share/sangfor/EasyConnect/resources/conf /usr/share/sangfor/EasyConnect/resources/conf_backup \
@@ -73,22 +77,25 @@ COPY ./rootfs/ /
 
 RUN chmod 0755 /etc /etc/systemd /etc/systemd/system \
                /etc/systemd/system/EasyMonitor.service.d /etc/zt \
-               /usr /usr/bin /usr/local /usr/local/bin \
+               /usr /usr/bin /usr/local /usr/local/bin /usr/local/sbin \
                /usr/share /usr/share/sangfor /usr/share/sangfor/EasyConnect \
                /usr/share/sangfor/EasyConnect/resources \
                /usr/share/sangfor/EasyConnect/resources/shell \
-               /usr/local/bin/zt-init /usr/local/bin/zt-net-setup.sh \
+               /usr/local/bin/zt-init /usr/local/bin/zt-identity \
+               /usr/local/bin/zt-net-setup.sh /usr/local/sbin/zt-iptables \
                /usr/bin/xdg-open /usr/local/bin/zt-conf.sh \
-               /usr/local/bin/zt-sangfor-session.sh \
+               /usr/local/bin/zt-sangfor-daemon.sh /usr/local/bin/zt-sangfor-ui.sh \
                /usr/share/sangfor/EasyConnect/resources/shell/open_browser.sh \
-    && chmod 0644 /etc/systemd/system/zt-net.service /etc/systemd/system/zt-socks.service \
-                  /etc/systemd/system/zt-sangfor.service \
+    && [ "$(readlink /usr/sbin/iptables)" = /usr/local/sbin/zt-iptables ] \
+    && chmod 0644 /etc/systemd/system/zt-net.service \
+                  /etc/systemd/system/zt-sangfor-daemon.service \
+                  /etc/systemd/system/zt-sangfor-ui.service \
                   /etc/systemd/system/EasyMonitor.service.d/zt.conf \
                   /etc/zt/state-paths.conf \
     && install -d -o kasm-user -g kasm-user /home/kasm-user/conf \
     && chown -R kasm-user:kasm-user /home/kasm-user \
     && chmod -R o-w /home/kasm-user \
-    && systemctl enable zt-net.service zt-sangfor.service zt-socks.service
+    && systemctl enable zt-net.service zt-sangfor-daemon.service zt-sangfor-ui.service
 
 # PID 1 (zt-init -> systemd) starts as root; desktop and SOCKS units run unprivileged.
 USER root

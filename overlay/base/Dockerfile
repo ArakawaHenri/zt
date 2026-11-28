@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Minimal KasmVNC web desktop on official ubuntu:24.04 with systemd as PID 1.
 #
 # Built directly from Canonical's official ubuntu:24.04 image and the official
@@ -17,7 +16,7 @@ RUN apt-get update \
         systemd systemd-sysv dbus dbus-x11 \
         tzdata locales ca-certificates openssl \
         iproute2 iptables iputils-ping \
-        openbox stalonetray wmctrl x11-utils x11-xserver-utils xclip xterm \
+        openbox stalonetray wmctrl x11-utils x11-xserver-utils xclip autocutsel dunst libnotify-bin xterm \
         python3 gettext ssl-cert libxfont2 \
     && apt-get install -y --no-install-recommends /tmp/kasmvncserver.deb \
     && rm -f /tmp/kasmvncserver.deb \
@@ -32,10 +31,29 @@ RUN apt-get update \
 COPY ./rootfs/ /
 
 RUN chmod 0755 /etc /etc/kasmvnc /etc/systemd /etc/systemd/system \
-               /etc/zt /etc/zt/openbox /usr /usr/local /usr/local/bin \
-               /usr/local/bin/zt-kasmvnc.sh \
+               /etc/systemd/system.conf.d /etc/zt /etc/zt/openbox \
+               /usr /usr/local /usr/local/bin /usr/local/bin/zt-kasmvnc.sh \
     && chmod 0644 /etc/kasmvnc/kasmvnc.yaml /etc/systemd/system/kasmvnc.service \
+                  /etc/systemd/system.conf.d/99-zt-limits.conf /etc/gai.conf \
                   /etc/zt/openbox/autostart /etc/zt/openbox/menu.xml \
+    && install -d -o root -g root -m 0755 \
+               /usr/local/sbin /usr/local/lib /usr/local/lib/zt-ipt \
+               /usr/local/lib/zt-ipt/nft /usr/local/lib/zt-ipt/legacy \
+    && for cmd in iptables iptables-save iptables-restore \
+                  ip6tables ip6tables-save ip6tables-restore; do \
+           ln -snf /usr/sbin/xtables-nft-multi "/usr/local/lib/zt-ipt/nft/$cmd"; \
+           ln -snf /usr/sbin/xtables-legacy-multi "/usr/local/lib/zt-ipt/legacy/$cmd"; \
+           ln -snf /usr/local/sbin/zt-iptables "/usr/sbin/$cmd"; \
+       done \
+    && for cmd in iptables-nft iptables-nft-save iptables-nft-restore \
+                  iptables-legacy iptables-legacy-save iptables-legacy-restore \
+                  ip6tables-nft ip6tables-nft-save ip6tables-nft-restore \
+                  ip6tables-legacy ip6tables-legacy-save ip6tables-legacy-restore; do \
+           ln -snf /usr/local/sbin/zt-iptables "/usr/sbin/$cmd"; \
+       done \
+    && rm -f /etc/machine-id /var/lib/dbus/machine-id \
+    && : > /etc/machine-id && chmod 0444 /etc/machine-id \
+    && ln -snf /etc/machine-id /var/lib/dbus/machine-id \
     && install -d -o root -g root -m 0755 /var/lib/zt-state \
     && install -d -o kasm-user -g kasm-user /home/kasm-user/.config/openbox \
     && cp /etc/zt/openbox/autostart /home/kasm-user/.config/openbox/autostart \

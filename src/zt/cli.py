@@ -1,11 +1,16 @@
 """Encapsulated 9-command CLI: up, down, status, doctor, purge, accept, password, use, update."""
 import argparse
 import getpass
+import json
 import os
+import platform
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 from zt import VERSION
 from zt.bridge import (
@@ -19,16 +24,23 @@ from zt.bridge import (
 )
 from zt.build import build, current_ref
 from zt.config import (
+    PASSWORD_MAX,
+    PASSWORD_MIN,
     accept_mode,
     auth_fingerprint,
     bind_address,
     cache_dir,
     clear_engine,
     config_file,
+    container_desktop_port,
     container_env,
+    container_publish_host,
     delete_setting,
     die,
+    ensure_identity_mac,
+    health_file,
     host_timezone,
+    identity_file,
     password_valid,
     save_engine,
     say,
@@ -51,6 +63,7 @@ from zt.spec import (
     desktop_backend_port,
     desktop_port,
     desktop_url,
+    normalize_arch,
     platform_for,
     resolve_targets,
     socks_port,
@@ -101,20 +114,23 @@ def _scope_summary(mode):
 
 
 def ensure_container(engine, profile, env, mode, arch=None):
-    """Converge the client's container to its desired image, bind host, settings, and state volume."""
+    """Converge the client's container to its desired image, bind host, MAC, settings, and state volume."""
     arch = arch or target_arch()
     name = container_name(profile)
     ref = current_ref(profile, arch)
     volume = state_volume_name(profile)
-    # In `accept lan`, the container publishes only to loopback backend port;
-    # the host bridge guards 0.0.0.0:<desktop_port> by source IP.
-    publish_host = '127.0.0.1' if mode in ('local', 'lan') else '0.0.0.0'
-    publish_port = desktop_backend_port(profile) if mode == 'lan' else desktop_port(profile)
+    mac = ensure_identity_mac(profile, engine.cli)
+    # Container :6901 always publishes on loopback; `lan` and `all` are fronted by host `bridge.py`.
+    publish_host = container_publish_host(mode)
+    publish_port = container_desktop_port(profile, mode=mode)
     # `zt.*` labels track container reconcile state (distinct from `org.zt.*` image/volume ownership).
     wanted = {
         'zt.profile': profile,
         'zt.image': ref,
-        'zt.state': engine.fingerprint(ref, env, publish_port, bind_host=publish_host, volume=volume),
+        'zt.state': engine.fingerprint(
+            ref, env, publish_port, bind_host=publish_host, volume=volume,
+            profile=profile, mac_address=mac, arch=arch,
+        ),
     }
     info = engine.inspect(name)
     recreated = False
@@ -144,9 +160,9 @@ def ensure_container(engine, profile, env, mode, arch=None):
         engine.ensure_volume(volume, profile)
         engine.run_container(
             name, ref, env, publish_port, wanted,
-            bind_host=publish_host, arch=arch, volume=volume, quiet=True,
+            bind_host=publish_host, arch=arch, volume=volume, quiet=True, mac_address=mac,
         )
-        if engine.container_state(profile) in ('exited', 'dead'):
+        if engine.container_state(profile) in ('exited', 'dead', 'stopped'):
             return f'{profile}: the container exited as soon as it started'
         say(f'{profile}: created')
         if recreated:
@@ -162,10 +178,10 @@ def ensure_container(engine, profile, env, mode, arch=None):
 def _prompt_and_save_password():
     if 'ZT_VNC_PW' in os.environ:
         die('ZT_VNC_PW is set in the environment; unset it to store a password in the file instead')
-    password = getpass.getpass('Password (6 to 8 characters): ')
+    password = getpass.getpass(f'Password ({PASSWORD_MIN} to {PASSWORD_MAX} characters): ')
     if not password_valid(password):
         die(
-            'the password must be 6 to 8 characters, without spaces at the ends and '
+            f'the password must be {PASSWORD_MIN} to {PASSWORD_MAX} characters, without spaces at the ends and '
             'without starting with #, a quote or an apostrophe'
         )
     if getpass.getpass('Once more: ') != password:
@@ -288,11 +304,19 @@ def cmd_up(args):
         else:
             problem = bridge_start(engine, profile, mode=mode)
             if problem:
-                what = 'LAN bridge' if mode == 'lan' else f'SOCKS5 on {bind_host}:{socks_port(profile)}'
+                what = (
+                    'LAN bridge'
+                    if mode == 'lan'
+                    else 'VNC/SOCKS5 bridge'
+                    if mode == 'all'
+                    else f'SOCKS5 on {bind_host}:{socks_port(profile)}'
+                )
                 warn(f'{profile}: {what} did not start: {problem}')
-            elif mode == 'lan':
+                problems.append(f'{profile}: {what} did not start: {problem}')
+            elif mode in ('lan', 'all'):
+                label = 'LAN guard' if mode == 'lan' else 'VNC proxy'
                 say(
-                    f'{profile}: LAN guard on {bind_host}:{desktop_port(profile)} '
+                    f'{profile}: {label} on {bind_host}:{desktop_port(profile)} '
                     f'and SOCKS5 on {bind_host}:{socks_port(profile)}'
                 )
             else:
@@ -341,6 +365,10 @@ def cmd_purge(args):
             for ctx in build_dir.glob(f'{profile}-*'):
                 shutil.rmtree(ctx, ignore_errors=True)
                 did_something = True
+        for state_file in (health_file(profile), identity_file(profile)):
+            if state_file.exists():
+                state_file.unlink(missing_ok=True)
+                did_something = True
         if not did_something:
             say(f'{profile}: nothing to purge')
 
@@ -366,6 +394,31 @@ def cmd_purge(args):
                         say(f'{profile}: cached blob removed ({sha[:12]})')
 
 
+def _read_health_snapshot(profile, max_age=90):
+    """Read host-persisted health-<profile>.json with zero container exec latency."""
+    try:
+        data = json.loads(health_file(profile).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    updated = data.get('updated_at') or data.get('ts') or 0
+    if isinstance(updated, (int, float)) and updated > 0:
+        if time.time() - float(updated) > max_age:
+            return None
+    return data
+
+
+def _format_vpn_status(health):
+    if not health:
+        return '-'
+    vpn = str(health.get('vpn') or '').strip()
+    iface = str(health.get('iface') or '').strip()
+    if vpn == 'connected' and iface:
+        return f'connected ({iface})'
+    return vpn or '-'
+
+
 def cmd_status(args=None, engine=None):
     arch = target_arch()
     if engine is None:
@@ -385,8 +438,11 @@ def cmd_status(args=None, engine=None):
         f'engine: {engine.cli} | accept: {mode} ({_scope_summary(mode)}) '
         f'| auth: {auth_summary} | platform: {platform_for(arch)}'
     )
-    say(f'{"client":<12} {"container":<10} {"image":<8} {"desktop":<26} socks')
+    say(f'{"client":<12} {"container":<10} {"vpn":<18} {"image":<8} {"desktop":<26} socks')
     foreign = False
+    sso_hints = []
+    disk_warnings = []
+    now = time.time()
     for profile in profiles:
         info = engine.inspect(container_name(profile))
         state = info['status']['state'] if info else '-'
@@ -402,6 +458,24 @@ def cmd_status(args=None, engine=None):
         port = socks_port(profile)
         live_pid, live_engine, live_accept, live_hash, live_proto = bridge_record(profile)
         ours = bool(live_pid and live_engine == engine.cli)
+        health = _read_health_snapshot(profile) if state == 'running' else None
+        vpn_col = _format_vpn_status(health) if state == 'running' else '-'
+        if health:
+            sso_url = health.get('sso_url') or ''
+            sso_ts = health.get('sso_ts') or 0
+            if sso_url and (not sso_ts or now - float(sso_ts) <= 300):
+                cb_ports = health.get('callback_ports') or []
+                cb_note = (
+                    f' (callback 127.0.0.1:{",".join(str(p) for p in cb_ports)} active)'
+                    if cb_ports
+                    else ''
+                )
+                sso_hints.append(f'{profile}: SSO URL{cb_note}: {sso_url}')
+            used_pct = health.get('state_used_pct')
+            avail_mb = health.get('state_avail_mb')
+            if isinstance(used_pct, (int, float)) and used_pct >= 85:
+                free_str = f' ({int(avail_mb)} MB free)' if isinstance(avail_mb, (int, float)) else ''
+                disk_warnings.append(f'{profile}: state volume {int(used_pct)}% full{free_str}')
         if ours:
             if not bridge_matches(live_accept, live_hash, live_proto, mode, wanted_hash):
                 socks = 'stale (run zt up)'
@@ -414,9 +488,95 @@ def cmd_status(args=None, engine=None):
             socks = f'other ({live_engine})' if live_pid and live_engine else 'other'
         else:
             socks = '-'
-        say(f'{profile:<12} {state:<10} {image:<8} {desktop:<26} {socks}')
+        say(f'{profile:<12} {state:<10} {vpn_col:<18} {image:<8} {desktop:<26} {socks}')
+    for hint in sso_hints:
+        say(hint)
+    for note in disk_warnings:
+        warn(note)
     if foreign:
         say(f'socks "other": port is served by something other than a {engine.display_name} zt bridge')
+
+
+def _check_linux_host_prechecks(engine, arch, check):
+    """Host kernel / userns / cgroup / binfmt prechecks on native Linux."""
+    tun = Path('/dev/net/tun')
+    try:
+        tun_ok = tun.exists() and stat.S_ISCHR(tun.stat().st_mode)
+    except OSError:
+        tun_ok = False
+    check('/dev/net/tun', tun_ok, 'present' if tun_ok else 'missing (load kernel module `tun`)')
+
+    is_rootless = getattr(engine, 'is_rootless', False) is True
+    aa_path = Path('/proc/sys/kernel/apparmor_restrict_unprivileged_userns')
+    if aa_path.is_file():
+        try:
+            aa_val = aa_path.read_text(encoding='utf-8').strip()
+        except OSError:
+            aa_val = ''
+        if aa_val == '1' and is_rootless:
+            check(
+                'apparmor userns',
+                False,
+                'apparmor_restrict_unprivileged_userns=1 may block rootless containers',
+            )
+        else:
+            check('apparmor userns', True, f'restrict={aa_val or "unknown"}')
+
+    if is_rootless:
+        uid = os.getuid()
+        cg_ctrl = Path(f'/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/cgroup.controllers')
+        if cg_ctrl.is_file():
+            try:
+                ctrls = set(cg_ctrl.read_text(encoding='utf-8').split())
+            except OSError:
+                ctrls = set()
+            delegated = {'memory', 'pids'}.issubset(ctrls)
+            check(
+                'cgroup v2 delegate',
+                delegated,
+                'memory + pids' if delegated else f'missing memory/pids in {cg_ctrl} (got: {" ".join(sorted(ctrls)) or "none"})',
+            )
+
+    native = normalize_arch(platform.machine())
+    if native and arch != native:
+        binfmt_dir = Path('/proc/sys/fs/binfmt_misc')
+        pattern = 'qemu-x86_64*' if arch == 'amd64' else 'qemu-aarch64*'
+        matched_entry = None
+        has_fix_flag = False
+        if binfmt_dir.is_dir():
+            for entry in sorted(binfmt_dir.glob(pattern)):
+                try:
+                    text = entry.read_text(encoding='utf-8', errors='replace')
+                except OSError:
+                    continue
+                if 'enabled' in text:
+                    matched_entry = entry.name
+                    for line in text.splitlines():
+                        if line.startswith('flags:') and 'F' in line.split(':', 1)[1]:
+                            has_fix_flag = True
+                    if has_fix_flag:
+                        break
+        check(
+            f'binfmt ({arch})',
+            bool(matched_entry and has_fix_flag),
+            f'{matched_entry} (flags include F)'
+            if (matched_entry and has_fix_flag)
+            else f'missing enabled {pattern} with F flag for cross-arch {platform_for(arch)}',
+        )
+
+
+def _check_macos_cross_arch(arch, check):
+    native = normalize_arch(platform.machine())
+    if native == 'arm64' and arch == 'amd64':
+        rosetta_ok = any(
+            Path(p).exists()
+            for p in ('/Library/Apple/usr/share/rosetta/rosetta', '/usr/libexec/rosetta')
+        )
+        check(
+            'rosetta (amd64)',
+            rosetta_ok,
+            'installed' if rosetta_ok else 'not found (run: softwareupdate --install-rosetta)',
+        )
 
 
 def cmd_doctor(args):
@@ -462,7 +622,7 @@ def cmd_doctor(args):
         check(
             'password',
             False,
-            f'must be 6 to 8 characters (got {len(password)}); run "zt password"',
+            f'must be {PASSWORD_MIN} to {PASSWORD_MAX} characters (got {len(password)}); run "zt password"',
         )
 
     zone = host_timezone()
@@ -474,6 +634,11 @@ def cmd_doctor(args):
     check('host time zone', bool(zone), zone or tz_missing)
     if not (present and running):
         sys.exit(0 if all(findings) else 1)
+
+    if sys.platform.startswith('linux'):
+        _check_linux_host_prechecks(engine, arch, check)
+    elif sys.platform == 'darwin':
+        _check_macos_cross_arch(arch, check)
 
     if getattr(engine, 'is_rootless_podman', False):
         check('capabilities', True, 'privileged (confined by rootless Podman user namespace)')
@@ -528,7 +693,7 @@ def cmd_doctor(args):
         else:
             free = port_free(port)
             check(f'port {port}', free, '' if free else engine.port_holders(port) or 'taken')
-            if mode == 'lan':
+            if mode in ('lan', 'all'):
                 bport = desktop_backend_port(profile)
                 bfree = port_free(bport, '127.0.0.1')
                 if not bfree:
