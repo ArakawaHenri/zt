@@ -98,7 +98,7 @@ jobs:
         with:
           platforms: amd64
 
-      - name: Verify native arm64 and QEMU cross-arch amd64 containers
+      - name: Verify native arm64 container (19-check two-boot suite)
         env:
           PYTHONDONTWRITEBYTECODE: '1'
           PYTHONPATH: src
@@ -106,7 +106,56 @@ jobs:
           ZT_CAPS: least
         run: |
           python3 -m zt.verify --build --profile trustagent --accept local --arch arm64
-          python3 -m zt.verify --build --profile trustagent --accept local --arch amd64
+
+      - name: Verify QEMU cross-arch amd64 build, ELF architecture, and overlay tools
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          PYTHONPATH: src
+          ZT_ENGINE: docker
+        run: |
+          # Linux qemu-user binfmt cannot translate NETLINK_NETFILTER / IPT_SO_SET_REPLACE
+          # sockopts required by zt-net.service during a full systemd boot, so validate the
+          # cross-arch amd64 image build, ELF target, shared libraries, and zt-identity under QEMU.
+          python3 -c "from zt.build import build; from zt.engine import make_engine; e = make_engine(); e.require(); build(e, 'trustagent', arch='amd64')"
+          ref="$(python3 -c "from zt.build import current_ref; print(current_ref('trustagent', 'amd64'))")"
+          arch="$(docker image inspect --format '{{.Architecture}}' "$ref")"
+          test "$arch" = "amd64"
+          docker run --rm --platform linux/amd64 -i --entrypoint /usr/bin/python3 "$ref" - <<'PY'
+          import os, pathlib, platform, struct, subprocess, tempfile
+
+          assert platform.machine() == 'x86_64', platform.machine()
+          assert os.readlink('/usr/sbin/iptables') == '/usr/local/sbin/zt-iptables'
+
+          for path in (
+              '/opt/apps/com.qianxin.trustagent/files/bin/trustdservice',
+              '/opt/apps/com.qianxin.trustagent/files/bin/TrustAgent',
+          ):
+              hdr = pathlib.Path(path).read_bytes()[:20]
+              assert hdr[:4] == b'\x7fELF', f'{path} is not ELF'
+              e_machine = struct.unpack_from('<H', hdr, 18)[0]
+              assert e_machine == 62, f'{path} e_machine={e_machine}, expected 62 (x86_64)'
+
+          ldd = subprocess.run(
+              ['ldd', '/opt/apps/com.qianxin.trustagent/files/bin/trustdservice'],
+              capture_output=True, text=True, check=True,
+          )
+          assert 'not found' not in ldd.stdout, ldd.stdout
+
+          with tempfile.TemporaryDirectory() as tmp:
+              subprocess.run(
+                  ['/usr/local/bin/zt-identity', '--seed', '0123456789abcdef0123456789abcdef', '--dump-dir', tmp],
+                  check=True,
+              )
+              for rel in (
+                  'dmi/tables/smbios_entry_point',
+                  'dmi/tables/DMI',
+                  'dmi/id/product_uuid',
+                  'dmi/id/product_serial',
+              ):
+                  p = pathlib.Path(tmp) / rel
+                  assert p.is_file() and p.stat().st_size > 0, f'missing {rel}'
+          print('amd64 cross-arch build, ELF, ldd, and zt-identity OK')
+          PY
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
